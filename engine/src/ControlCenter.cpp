@@ -1,6 +1,7 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <TlHelp32.h>
 #include <commctrl.h>
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
@@ -272,14 +273,17 @@ bool SaveSelectedConfiguration() {
     cfg.erase("out");
     cfg.erase("out_spdif");
     cfg["loopback"] = "0";
-    const LRESULT modeSel = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
-    if (modeSel == 2) {
-        cfg["output_mode"] = "pcm";
-        cfg["upmix"] = "off";
-    } else {
-        cfg["output_mode"] = "ac3";
-        cfg["upmix"] = modeSel == 0 ? "off" : "surround";
-    }
+  const LRESULT modeSel = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
+  if (modeSel == 2) {
+      cfg["output_mode"] = "pcm";
+      cfg["upmix"] = "off";
+  } else if (modeSel == 3) {
+      cfg["output_mode"] = "dts";
+      cfg["upmix"] = "surround";
+  } else {
+      cfg["output_mode"] = "ac3";
+      cfg["upmix"] = modeSel == 0 ? "off" : "surround";
+  }
     if (!WriteKvAtomic(g_configPath, cfg)) {
         MessageBoxW(g_window, L"Не удалось записать virtual-ac3-encoder.conf. Проверь права доступа к папке.", L"AC3 Control Center", MB_ICONERROR);
         return false;
@@ -297,12 +301,96 @@ void CloseProcessHandles() {
     ZeroMemory(&g_engine, sizeof(g_engine));
 }
 
+bool FindAndAttachExistingEngine() {
+    const std::wstring expectedPath = g_exeDir + L"\\engine.exe";
+
+    std::wstring fullExpectedPath(32768, L'\0');
+    DWORD pathLength = GetFullPathNameW(
+        expectedPath.c_str(),
+        static_cast<DWORD>(fullExpectedPath.size()),
+        fullExpectedPath.data(),
+        nullptr
+    );
+
+    if (pathLength == 0 || pathLength >= fullExpectedPath.size())
+        return false;
+
+    fullExpectedPath.resize(pathLength);
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return false;
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+
+    bool attached = false;
+
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (CompareStringOrdinal(
+                    entry.szExeFile, -1, L"engine.exe", -1, TRUE
+                ) != CSTR_EQUAL) {
+                continue;
+            }
+
+            HANDLE process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION |
+                SYNCHRONIZE |
+                PROCESS_TERMINATE,
+                FALSE,
+                entry.th32ProcessID
+            );
+
+            if (!process)
+                continue;
+
+            std::wstring actualPath(32768, L'\0');
+            DWORD actualLength = static_cast<DWORD>(actualPath.size());
+
+            const BOOL queried = QueryFullProcessImageNameW(
+                process, 0, actualPath.data(), &actualLength
+            );
+
+            if (queried) {
+                actualPath.resize(actualLength);
+
+                if (CompareStringOrdinal(
+                        actualPath.c_str(), -1,
+                        fullExpectedPath.c_str(), -1, TRUE
+                    ) == CSTR_EQUAL &&
+                    WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+
+                    g_engine.hProcess = process;
+                    g_engine.hThread = nullptr;
+                    g_engine.dwProcessId = entry.th32ProcessID;
+                    g_engine.dwThreadId = 0;
+                    attached = true;
+                    break;
+                }
+            }
+
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return attached;
+}
+
 bool StartEngine() {
     if (EngineRunning()) {
         SetStatus(L"Кодировщик уже работает.");
         return true;
     }
+
     CloseProcessHandles();
+
+    if (FindAndAttachExistingEngine()) {
+        SetStatus(L"Подключено к уже работающему кодировщику.");
+        return true;
+    }
+
     if (!SaveSelectedConfiguration()) return false;
     const std::wstring enginePath = g_exeDir + L"\\engine.exe";
     const DWORD attrs = GetFileAttributesW(enginePath.c_str());
@@ -333,9 +421,9 @@ bool StartEngine() {
 }
 
 void StopEngine(bool updateStatus = true) {
-    if (!g_engine.hProcess) {
+    if (!g_engine.hProcess && !FindAndAttachExistingEngine()) {
         WriteControlFile(false);
-        if (updateStatus) SetStatus(L"Кодировщик остановлен.");
+        if (updateStatus) SetStatus(L"Работающий кодировщик не найден.");
         return;
     }
     if (EngineRunning()) {
@@ -420,6 +508,7 @@ void CreateControls(HWND hwnd) {
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — без upmix"));
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — Surround upmix"));
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM Stereo 2.0 — обычный S/PDIF"));
+  SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DTS 5.1 Core - Toslink / S/PDIF"));
     AddControl(L"BUTTON", L"Применить / перезапустить", BS_PUSHBUTTON | WS_TABSTOP, 575, 88, 275, 30, ID_APPLY, hwnd);
 
     AddControl(L"STATIC", L"Громкость каналов (−60 dB = MUTE; 0 dB = исходный уровень). Ползунки применяются на лету.", 0, 20, 130, 830, 24, 0, hwnd);
@@ -449,7 +538,8 @@ void CreateControls(HWND hwnd) {
     if (outIndex < 0) outIndex = PreferredOutput();
     if (inIndex >= 0) SendMessageW(g_inputCombo, CB_SETCURSEL, inIndex, 0);
     if (outIndex >= 0) SendMessageW(g_outputCombo, CB_SETCURSEL, outIndex, 0);
-    const LRESULT selectedMode = cfg["output_mode"] == "pcm" ? 2 : (cfg["upmix"] == "off" ? 0 : 1);
+    const LRESULT selectedMode = cfg["output_mode"] == "pcm" ? 2 :
+        cfg["output_mode"] == "dts" ? 3 : (cfg["upmix"] == "off" ? 0 : 1);
     SendMessageW(g_modeCombo, CB_SETCURSEL, selectedMode, 0);
     UpdateModeControls();
     EnableWindow(g_startButton, !g_captureDevices.empty() && !g_renderDevices.empty());
@@ -469,6 +559,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             const LRESULT mode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
             if (mode == 2)
                 SetStatus(L"Выбран PCM Stereo 2.0. Нажми «Применить / перезапустить» для переключения формата.");
+            else if (mode == 3)
+                SetStatus(L"DTS 5.1 Core выбран. Нажми Применить / перезапустить для переключения формата.");
             else
                 SetStatus(L"Выбран выход Dolby Digital 5.1. Нажми «Применить / перезапустить» для переключения формата.");
             return 0;
@@ -522,7 +614,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         }
         return 0;
     case WM_CLOSE:
-        StopEngine(false);
+        CloseProcessHandles();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -562,7 +654,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         if (uninitializeCom) CoUninitialize();
         return 1;
     }
-    g_window = CreateWindowExW(0, CLASS_NAME, L"AC3 Control Center — Dolby Digital / PCM Stereo",
+    g_window = CreateWindowExW(0, CLASS_NAME, L"AC3 / DTS Control Center - Dolby Digital / DTS / PCM Stereo",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 900, 640, nullptr, nullptr, instance, nullptr);
     if (!g_window) {
@@ -571,6 +663,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
     ShowWindow(g_window, showCommand);
     UpdateWindow(g_window);
+    if (StartEngine()) {
+        EnableWindow(g_startButton, FALSE);
+        EnableWindow(g_stopButton, TRUE);
+    }
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);

@@ -282,7 +282,7 @@ int main(int argc, char** argv)
 
   if (cfg.probe)
   {
-    std::printf("AC3 passthrough support (IsFormatSupported, exclusive):\n");
+    std::printf("IEC 61937 passthrough support (IsFormatSupported, exclusive):\n");
     for (const auto& e : DeviceEnum::List(eRender))
     {
       ComPtr<IMMDevice> d;
@@ -290,8 +290,10 @@ int main(int argc, char** argv)
         continue;
       bool ok48 = WasapiPassthrough::ProbeAc3(d.Get(), 48000);
       bool ok44 = WasapiPassthrough::ProbeAc3(d.Get(), 44100);
-      std::printf("  %-48s %s  AC3@48k:%s  AC3@44.1k:%s\n", Narrow(e.name.c_str()).c_str(),
-                  e.isSpdif ? "[SPDIF]" : "       ", ok48 ? "YES" : "no ", ok44 ? "YES" : "no ");
+      bool dts48 = WasapiPassthrough::ProbeDts(d.Get(), 48000);
+      bool dts44 = WasapiPassthrough::ProbeDts(d.Get(), 44100);
+      std::printf("  %-48s %s  AC3@48k:%s  AC3@44.1k:%s  DTS@48k:%s  DTS@44.1k:%s\n", Narrow(e.name.c_str()).c_str(),
+                  e.isSpdif ? "[SPDIF]" : "       ", ok48 ? "YES" : "no ", ok44 ? "YES" : "no ", dts48 ? "YES" : "no ", dts44 ? "YES" : "no ");
     }
     return 0;
   }
@@ -322,6 +324,7 @@ int main(int argc, char** argv)
   capture.SetRing(&ring);
 
   const bool pcmMode = (cfg.outputMode == "pcm");
+  const bool dtsMode = (cfg.outputMode == "dts");
   WasapiPassthrough ac3Out;
   WasapiPcmOutput pcmOut;
   if (pcmMode)
@@ -332,6 +335,7 @@ int main(int argc, char** argv)
   else
   {
     WasapiPassthrough::Params pp;
+    pp.codec = dtsMode ? SpdifEncoder::Codec::DTS : SpdifEncoder::Codec::AC3;
     pp.bitRate = cfg.bitRate;
     pp.safeFrames = cfg.safeFrames;
     pp.upmixSurround = (cfg.upmix == "surround");

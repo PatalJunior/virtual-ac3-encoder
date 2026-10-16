@@ -32,6 +32,8 @@ extern "C" {
 class SpdifEncoder
 {
 public:
+  enum class Codec { AC3, DTS };
+
   SpdifEncoder();
   ~SpdifEncoder();
   SpdifEncoder(const SpdifEncoder&) = delete;
@@ -47,6 +49,7 @@ public:
 
   struct Params
   {
+    Codec codec = Codec::AC3;
     int sampleRate = 48000;                       // AC3: 48000 / 44100 / 32000
     int64_t bitRate = 640000;                     // AC3-over-optical maximum
     AVSampleFormat inSampleFmt = AV_SAMPLE_FMT_FLT; // interleaved input from WASAPI/WAV
@@ -90,11 +93,14 @@ private:
   AVCodecContext*  codecCtx_ = nullptr;
   AVFormatContext* muxer_    = nullptr;
   SwrContext*      swr_      = nullptr;
-  AVFrame*         frame_    = nullptr;  // planar-float scratch fed to the encoder
+  SwrContext*      dtsS32Swr_ = nullptr; // FLTP to packed S32 for DTS
+  AVFrame*         frame_    = nullptr;  // planar-float processing frame
+  AVFrame*         dtsFrame_  = nullptr;  // packed S32 frame for the DTS encoder
   AVPacket*        pkt_      = nullptr;
 
   // surround-upmix pipeline (used when upmix == Surround and input is <= 2ch)
   bool             useFilter_ = false;
+  bool             useDts_ = false;
   AVFilterGraph*   graph_     = nullptr;
   AVFilterContext* fsrc_      = nullptr; // abuffer
   AVFilterContext* fsink_     = nullptr; // abuffersink
