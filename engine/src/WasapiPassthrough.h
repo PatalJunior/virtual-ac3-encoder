@@ -12,6 +12,7 @@
 #include "RingBuffer.h"
 #include "SpdifEncoder.h"
 #include "WasapiCapture.h" // CaptureFormat
+#include <array>
 
 #include <audioclient.h>
 #include <mmdeviceapi.h>
@@ -43,6 +44,8 @@ public:
   bool Init(IMMDevice* dev, RingBuffer* ring, const CaptureFormat& capFmt, const Params& p);
   bool Start();
   void Stop();
+  // Thread-safe live trim for the six AC3 output channels, in dB.
+  void SetChannelGainsDb(const std::array<float, 6>& gainsDb) { enc_.SetChannelGainsDb(gainsDb); }
 
 private:
   bool InitExclusive(int rate);

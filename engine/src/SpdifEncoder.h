@@ -15,6 +15,8 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
+#include <atomic>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -30,7 +32,7 @@ extern "C" {
 class SpdifEncoder
 {
 public:
-  SpdifEncoder() = default;
+  SpdifEncoder();
   ~SpdifEncoder();
   SpdifEncoder(const SpdifEncoder&) = delete;
   SpdifEncoder& operator=(const SpdifEncoder&) = delete;
@@ -55,6 +57,8 @@ public:
 
   // Open the encoder. Returns false (and logs to stderr) on failure.
   bool Init(const Params& p);
+  // Per-output-channel trim. Values are clamped to -60..0 dB; -60 dB is digital mute.
+  void SetChannelGainsDb(const std::array<float, 6>& gainsDb);
   void Close();
   bool IsOpen() const { return codecCtx_ != nullptr; }
 
@@ -81,6 +85,7 @@ private:
   bool BuildFilterGraph();              // surround-upmix path
   bool FeedFilter(const uint8_t* in);  // push one input packet, drain output into fifo_
   int  EncodeFrameToBurst(uint8_t* outBuf, int outSize); // frame_ -> AC3 -> IEC61937
+  void ApplyChannelGains();
 
   AVCodecContext*  codecCtx_ = nullptr;
   AVFormatContext* muxer_    = nullptr;
@@ -100,6 +105,7 @@ private:
   AVSampleFormat   inSampleFmt_ = AV_SAMPLE_FMT_FLT;
   int              sampleRate_ = 48000;
   int              framesPerPacket_ = 0;
+  std::array<std::atomic<float>, 6> channelGainLinear_;
   int64_t          nextPts_ = 0;
 
   // Scratch state used by OnWritePacket() during a single EncodePacket() call.

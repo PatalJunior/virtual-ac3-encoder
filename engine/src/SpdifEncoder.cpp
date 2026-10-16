@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 extern "C" {
 #include <libavutil/error.h>
@@ -21,6 +23,43 @@ void LogAv(const char* what, int err)
 }
 
 } // namespace
+
+SpdifEncoder::SpdifEncoder()
+{
+  for (auto& gain : channelGainLinear_)
+    gain.store(1.0f, std::memory_order_relaxed);
+}
+
+void SpdifEncoder::SetChannelGainsDb(const std::array<float, 6>& gainsDb)
+{
+  for (size_t i = 0; i < channelGainLinear_.size(); ++i)
+  {
+    const float db = std::clamp(gainsDb[i], -60.0f, 0.0f);
+    const float linear = (db <= -60.0f) ? 0.0f : std::pow(10.0f, db / 20.0f);
+    channelGainLinear_[i].store(linear, std::memory_order_relaxed);
+  }
+}
+
+void SpdifEncoder::ApplyChannelGains()
+{
+  if (!frame_ || !frame_->extended_data || !codecCtx_)
+    return;
+  const int channels = std::min(6, codecCtx_->ch_layout.nb_channels);
+  for (int ch = 0; ch < channels; ++ch)
+  {
+    const float gain = channelGainLinear_[static_cast<size_t>(ch)].load(std::memory_order_relaxed);
+    if (gain >= 0.999999f)
+      continue;
+    float* samples = reinterpret_cast<float*>(frame_->extended_data[ch]);
+    if (!samples)
+      continue;
+    if (gain <= 0.0f)
+      std::fill_n(samples, frame_->nb_samples, 0.0f);
+    else
+      for (int i = 0; i < frame_->nb_samples; ++i)
+        samples[i] *= gain;
+  }
+}
 
 SpdifEncoder::~SpdifEncoder()
 {
@@ -285,6 +324,9 @@ int SpdifEncoder::EncodePacket(const uint8_t* in, uint8_t* outBuf, int outSize)
     if (got < 0) { LogAv("swr_convert", got); return -1; }
   }
 
+  // The encoder frame is always planar-float 5.1 (FL, FR, C, LFE, SL/BL, SR/BR).
+  // Atomic per-channel gains let the UI adjust levels without locking the audio thread.
+  ApplyChannelGains();
   frame_->pts = nextPts_;
   nextPts_ += framesPerPacket_;
   return EncodeFrameToBurst(outBuf, outSize);
