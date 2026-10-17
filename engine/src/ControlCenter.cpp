@@ -48,6 +48,7 @@ std::array<HWND, 6> g_values{};
 std::array<int, 6> g_gainDb{{0, 0, 0, 0, 0, 0}};
 std::vector<AudioDevice> g_captureDevices;
 std::vector<AudioDevice> g_renderDevices;
+bool g_inputListUsesRender = false;
 PROCESS_INFORMATION g_engine{};
 std::wstring g_exeDir;
 std::wstring g_configPath;
@@ -204,6 +205,40 @@ void PopulateDeviceCombo(HWND combo, const std::vector<AudioDevice>& devices) {
     for (const auto& device : devices) SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(device.name.c_str()));
 }
 
+bool IsLoopbackMode(int mode) {
+    return mode == 4 || mode == 5;
+}
+
+void UpdateInputDeviceComboForMode(int mode, const std::string& configuredId, bool preserveCurrentSelection) {
+    if (!g_inputCombo) return;
+
+    const bool useRender = IsLoopbackMode(mode);
+    std::string selectedId = configuredId;
+
+    // При переключении DTS <-> Dolby сохраняем выбранный источник.
+    if (preserveCurrentSelection && g_inputListUsesRender == useRender) {
+        const LRESULT oldSel = SendMessageW(g_inputCombo, CB_GETCURSEL, 0, 0);
+        const auto& oldDevices = g_inputListUsesRender ? g_renderDevices : g_captureDevices;
+
+        if (oldSel >= 0 && static_cast<size_t>(oldSel) < oldDevices.size())
+            selectedId = ToUtf8(oldDevices[static_cast<size_t>(oldSel)].id);
+    }
+
+    const auto& devices = useRender ? g_renderDevices : g_captureDevices;
+    PopulateDeviceCombo(g_inputCombo, devices);
+
+    int index = FindById(devices, selectedId);
+    if (index < 0)
+        index = FindBySubstring(devices, useRender ? "CABLE Input" : "CABLE Output");
+    if (index < 0 && !devices.empty())
+        index = 0;
+
+    if (index >= 0)
+        SendMessageW(g_inputCombo, CB_SETCURSEL, index, 0);
+
+    g_inputListUsesRender = useRender;
+}
+
 void SetStatus(const std::wstring& text) {
     if (g_status) SetWindowTextW(g_status, text.c_str());
 }
@@ -252,46 +287,73 @@ void ReadGainState() {
 }
 
 bool SaveSelectedConfiguration() {
-    const LRESULT inSel = SendMessageW(g_inputCombo, CB_GETCURSEL, 0, 0);
-    const LRESULT outSel = SendMessageW(g_outputCombo, CB_GETCURSEL, 0, 0);
-    if (inSel < 0 || static_cast<size_t>(inSel) >= g_captureDevices.size()) {
-        MessageBoxW(g_window, L"Выбери устройство входа (например, CABLE Output).", L"AC3 Control Center", MB_ICONWARNING);
+    const LRESULT modeResult = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
+
+    if (modeResult < 0 || modeResult > 5) {
+        MessageBoxW(g_window, L"Выбери режим кодирования.", L"AC3 Control Center", MB_ICONWARNING);
         return false;
     }
+
+    const int modeSel = static_cast<int>(modeResult);
+    const bool loopback = IsLoopbackMode(modeSel);
+    const auto& inputDevices = loopback ? g_renderDevices : g_captureDevices;
+
+    const LRESULT inSel = SendMessageW(g_inputCombo, CB_GETCURSEL, 0, 0);
+    const LRESULT outSel = SendMessageW(g_outputCombo, CB_GETCURSEL, 0, 0);
+
+    if (inSel < 0 || static_cast<size_t>(inSel) >= inputDevices.size()) {
+        MessageBoxW(g_window, L"Выбери входное устройство для выбранного режима.", L"AC3 Control Center", MB_ICONWARNING);
+        return false;
+    }
+
     if (outSel < 0 || static_cast<size_t>(outSel) >= g_renderDevices.size()) {
         MessageBoxW(g_window, L"Выбери цифровое устройство вывода, подключённое к ресиверу.", L"AC3 Control Center", MB_ICONWARNING);
         return false;
     }
+
     Kv cfg = ReadKv(g_configPath);
     if (cfg.empty()) {
         cfg["bitrate"] = "640000";
         cfg["safe"] = "1536";
     }
-    cfg["in_id"] = ToUtf8(g_captureDevices[static_cast<size_t>(inSel)].id);
+
+    cfg["in_id"] = ToUtf8(inputDevices[static_cast<size_t>(inSel)].id);
     cfg["out_id"] = ToUtf8(g_renderDevices[static_cast<size_t>(outSel)].id);
     cfg.erase("in");
     cfg.erase("out");
     cfg.erase("out_spdif");
-    cfg["loopback"] = "0";
-  const LRESULT modeSel = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
-  if (modeSel == 2) {
-      cfg["output_mode"] = "pcm";
-      cfg["upmix"] = "off";
-  } else if (modeSel == 3) {
-      cfg["output_mode"] = "dts";
-      cfg["upmix"] = "surround";
-  } else {
-      cfg["output_mode"] = "ac3";
-      cfg["upmix"] = modeSel == 0 ? "off" : "surround";
-  }
+    cfg["loopback"] = loopback ? "1" : "0";
+
+    if (modeSel == 2) {
+        cfg["output_mode"] = "pcm";
+        cfg["upmix"] = "off";
+    } else if (modeSel == 3) {
+        // Существующий DTS-режим с обычным захватом.
+        cfg["output_mode"] = "dts";
+        cfg["upmix"] = "surround";
+    } else if (modeSel == 4) {
+        // Новый многоканальный DTS Core: Loopback, без стереоапмикса.
+        cfg["output_mode"] = "dts";
+        cfg["upmix"] = "off";
+    } else if (modeSel == 5) {
+        // Новый многоканальный Dolby Digital: Loopback, без стереоапмикса.
+        cfg["output_mode"] = "ac3";
+        cfg["upmix"] = "off";
+    } else {
+        cfg["output_mode"] = "ac3";
+        cfg["upmix"] = modeSel == 0 ? "off" : "surround";
+    }
+
     if (!WriteKvAtomic(g_configPath, cfg)) {
         MessageBoxW(g_window, L"Не удалось записать virtual-ac3-encoder.conf. Проверь права доступа к папке.", L"AC3 Control Center", MB_ICONERROR);
         return false;
     }
+
     if (!WriteControlFile(false)) {
         MessageBoxW(g_window, L"Не удалось записать ac3-control.ini.", L"AC3 Control Center", MB_ICONERROR);
         return false;
     }
+
     return true;
 }
 
@@ -459,11 +521,20 @@ void ApplyConfiguration() {
 
 void UpdateModeControls() {
     if (!g_modeCombo) return;
-    const bool pcmMode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0) == 2;
+
+    const LRESULT mode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
+    const bool pcmMode = mode == 2;
+
     for (size_t i = 0; i < g_sliders.size(); ++i)
         EnableWindow(g_sliders[i], !pcmMode || i < 2);
-    if (pcmMode)
+
+    if (mode == 2) {
         SetStatus(L"PCM Stereo 2.0: используются только левый и правый каналы.");
+    } else if (mode == 4) {
+        SetStatus(L"PCM 5.1 -> DTS 5.1 Core: Loopback, без апмикса.");
+    } else if (mode == 5) {
+        SetStatus(L"PCM 5.1 -> Dolby Digital 5.1: Loopback, без апмикса.");
+    }
 }
 
 void ResetGains() {
@@ -477,6 +548,8 @@ void ResetGains() {
     WriteControlFile(false);
     SetStatus(EngineRunning() ? L"Все уровни сброшены на 0 dB и применены." : L"Уровни сброшены на 0 dB.");
 }
+
+bool g_uiOnly = false;
 
 void CheckEngineStatus() {
     if (!g_engine.hProcess) return;
@@ -495,7 +568,7 @@ HWND AddControl(const wchar_t* cls, const wchar_t* text, DWORD style,
 }
 
 void CreateControls(HWND hwnd) {
-    AddControl(L"STATIC", L"Входное устройство (WASAPI capture):", 0, 20, 18, 260, 24, 0, hwnd);
+    AddControl(L"STATIC", L"Входное устройство:", 0, 20, 18, 260, 24, 0, hwnd);
     g_inputCombo = AddControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 290, 16, 560, 240, ID_INPUT, hwnd);
     PopulateDeviceCombo(g_inputCombo, g_captureDevices);
 
@@ -508,7 +581,9 @@ void CreateControls(HWND hwnd) {
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — без upmix"));
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — Surround upmix"));
     SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM Stereo 2.0 — обычный S/PDIF"));
-  SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DTS 5.1 Core - Toslink / S/PDIF"));
+    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DTS 5.1 Core - Toslink / S/PDIF"));
+    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM 5.1 -> DTS 5.1 Core"));
+    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM 5.1 -> Dolby Digital 5.1"));
     AddControl(L"BUTTON", L"Применить / перезапустить", BS_PUSHBUTTON | WS_TABSTOP, 575, 88, 275, 30, ID_APPLY, hwnd);
 
     AddControl(L"STATIC", L"Громкость каналов (−60 dB = MUTE; 0 dB = исходный уровень). Ползунки применяются на лету.", 0, 20, 130, 830, 24, 0, hwnd);
@@ -529,18 +604,16 @@ void CreateControls(HWND hwnd) {
     g_status = AddControl(L"STATIC", L"Готов. Кодировщик остановлен.", 0, 20, 545, 830, 38, 0, hwnd);
 
     Kv cfg = ReadKv(g_configPath);
-    int inIndex = FindById(g_captureDevices, cfg["in_id"]);
-    if (inIndex < 0) inIndex = FindBySubstring(g_captureDevices, cfg["in"]);
-    if (inIndex < 0) inIndex = FindBySubstring(g_captureDevices, "CABLE Output");
-    if (inIndex < 0 && !g_captureDevices.empty()) inIndex = 0;
     int outIndex = FindById(g_renderDevices, cfg["out_id"]);
     if (outIndex < 0) outIndex = FindBySubstring(g_renderDevices, cfg["out"]);
     if (outIndex < 0) outIndex = PreferredOutput();
-    if (inIndex >= 0) SendMessageW(g_inputCombo, CB_SETCURSEL, inIndex, 0);
     if (outIndex >= 0) SendMessageW(g_outputCombo, CB_SETCURSEL, outIndex, 0);
     const LRESULT selectedMode = cfg["output_mode"] == "pcm" ? 2 :
-        cfg["output_mode"] == "dts" ? 3 : (cfg["upmix"] == "off" ? 0 : 1);
+        cfg["output_mode"] == "dts" ? (cfg["loopback"] == "1" ? 4 : 3) :
+        cfg["loopback"] == "1" ? 5 :
+        (cfg["upmix"] == "off" ? 0 : 1);
     SendMessageW(g_modeCombo, CB_SETCURSEL, selectedMode, 0);
+    UpdateInputDeviceComboForMode(static_cast<int>(selectedMode), cfg["in_id"], false);
     UpdateModeControls();
     EnableWindow(g_startButton, !g_captureDevices.empty() && !g_renderDevices.empty());
     EnableWindow(g_stopButton, FALSE);
@@ -554,11 +627,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
+
+        if (g_uiOnly &&
+            (id == ID_START || id == ID_STOP ||
+             id == ID_APPLY || id == ID_RESET))
+            return 0;
         if (id == ID_MODE && HIWORD(wParam) == CBN_SELCHANGE) {
-            UpdateModeControls();
             const LRESULT mode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
+            Kv currentCfg = ReadKv(g_configPath);
+            UpdateInputDeviceComboForMode(static_cast<int>(mode), currentCfg["in_id"], true);
+            UpdateModeControls();
             if (mode == 2)
                 SetStatus(L"Выбран PCM Stereo 2.0. Нажми «Применить / перезапустить» для переключения формата.");
+            else if (mode == 4)
+                SetStatus(L"PCM 5.1 -> DTS 5.1 Core: Loopback, без апмикса. Нажми «Применить / перезапустить».");
+            else if (mode == 5)
+                SetStatus(L"PCM 5.1 -> Dolby Digital 5.1: Loopback, без апмикса. Нажми «Применить / перезапустить».");
             else if (mode == 3)
                 SetStatus(L"DTS 5.1 Core выбран. Нажми Применить / перезапустить для переключения формата.");
             else
@@ -592,6 +676,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case WM_HSCROLL: {
+        if (g_uiOnly) return 0;
         if (g_initializing) return 0;
         HWND slider = reinterpret_cast<HWND>(lParam);
         for (size_t i = 0; i < g_sliders.size(); ++i) {
@@ -633,6 +718,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const bool uninitializeCom = SUCCEEDED(comHr);
 
+    g_uiOnly = std::wstring(GetCommandLineW()).find(L"--ui-only") != std::wstring::npos;
+
     g_exeDir = ExeDirectory();
     g_configPath = g_exeDir + L"\\virtual-ac3-encoder.conf";
     g_controlPath = g_exeDir + L"\\ac3-control.ini";
@@ -663,7 +750,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
     ShowWindow(g_window, showCommand);
     UpdateWindow(g_window);
-    if (StartEngine()) {
+    if (g_uiOnly) {
+        EnableWindow(g_startButton, FALSE);
+        EnableWindow(g_stopButton, FALSE);
+        EnableWindow(GetDlgItem(g_window, ID_APPLY), FALSE);
+        EnableWindow(GetDlgItem(g_window, ID_RESET), FALSE);
+        EnableWindow(g_inputCombo, FALSE);
+        EnableWindow(g_outputCombo, FALSE);
+
+        for (HWND slider : g_sliders) {
+            EnableWindow(slider, FALSE);
+        }
+
+        SetStatus(L"UI-only: просмотр режимов; движок и настройки не изменяются.");
+    } else if (StartEngine()) {
         EnableWindow(g_startButton, FALSE);
         EnableWindow(g_stopButton, TRUE);
     }
