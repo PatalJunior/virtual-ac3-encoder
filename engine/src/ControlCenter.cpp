@@ -72,7 +72,8 @@ int g_dtsBitrate = 0; // 0=Full 1536k, 1=Half 768k
 int g_ac3Bitrate = 0; // 0=640k, 1=448k
 int g_latencyPreset = 2; // 0=Extreme, 1=Fast, 2=Balanced, 3=Safe, 4=Relaxed
 int g_upmixMode = 0; // 0=Dynamic Surround (Auto), 1=Always Surround, 2=Off
-bool g_loopback = false;
+bool g_loopback = true;
+bool g_outAutoSpdif = true;
 bool g_configDirty = false;
 
 std::array<int, 6> g_gainDb{{0, 0, 0, 0, 0, 0}};
@@ -314,12 +315,18 @@ void SaveConfiguration() {
     if (g_selectedInDevice >= 0 && static_cast<size_t>(g_selectedInDevice) < inDevs.size())
         cfg["in_id"] = ToUtf8(inDevs[static_cast<size_t>(g_selectedInDevice)].id);
 
-    if (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
-        cfg["out_id"] = ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].id);
+    if (g_outAutoSpdif) {
+        cfg["out_spdif"] = "1";
+        cfg.erase("out_id");
+        cfg.erase("out");
+    } else {
+        if (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
+            cfg["out_id"] = ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].id);
+        cfg.erase("out_spdif");
+        cfg.erase("out");
+    }
 
     cfg.erase("in");
-    cfg.erase("out");
-    cfg.erase("out_spdif");
     cfg["loopback"] = g_loopback ? "1" : "0";
 
     if (g_outputMode == 0) {
@@ -347,7 +354,8 @@ void SaveConfiguration() {
 void LoadConfiguration() {
     Kv cfg = ReadKv(g_configPath);
 
-    g_loopback = (cfg["loopback"] == "1");
+    g_loopback = (cfg.find("loopback") == cfg.end()) || (cfg["loopback"] == "1");
+    g_outAutoSpdif = (cfg["out_spdif"] == "1") || (cfg.find("out_id") == cfg.end() && cfg.find("out") == cfg.end());
 
     RefreshDevices();
 
@@ -547,13 +555,14 @@ void SetupModernAudioStyle() {
     colors[ImGuiCol_PlotHistogram]         = ImVec4(0.15f, 0.85f, 0.65f, 1.00f);
 }
 
-// 6-channel VU meters renderer
+// 6-channel VU meters renderer (100% static mathematical layout, zero jitter)
 void DrawSpeakerVUMeters(bool isRunning) {
     ImGui::TextColored(ImVec4(0.7f, 0.75f, 0.8f, 1.0f), "REAL-TIME 5.1 SPEAKER METERS");
 
-    const float meterWidth = 96.0f;
-    const float meterHeight = 130.0f;
+    const float colWidth = 56.0f;
+    const float colSpacing = 10.0f;
     const float barWidth = 24.0f;
+    const float meterHeight = 130.0f;
 
     // Read shared memory levels
     std::array<float, 6> rawPeaks{{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
@@ -566,12 +575,15 @@ void DrawSpeakerVUMeters(bool isRunning) {
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 startPos = ImGui::GetCursorScreenPos();
+    const float headerH = ImGui::GetTextLineHeight();
+    const float meterTopY = startPos.y + headerH + 6.0f;
+    const float meterBottomY = meterTopY + meterHeight;
+    const float textY = meterBottomY + 6.0f;
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 0.0f));
     for (size_t i = 0; i < 6; ++i) {
-        if (i > 0) ImGui::SameLine();
-
-        ImGui::BeginGroup();
+        // Static horizontal position for channel i (never moves or fluctuates)
+        const float colStartX = startPos.x + static_cast<float>(i) * (colWidth + colSpacing);
 
         // Decay ballistics
         const float peak = rawPeaks[i];
@@ -596,24 +608,26 @@ void DrawSpeakerVUMeters(bool isRunning) {
         db = std::clamp(db, -60.0f, 0.0f);
         const float norm = (db + 60.0f) / 60.0f; // 0.0 to 1.0
 
-        // Channel header
-        ImGui::TextColored(ImVec4(0.13f, 0.75f, 0.85f, 1.0f), "%s", kChannelNames[i]);
+        // 1. Channel Header (Centered statically in colWidth)
+        const char* name = kChannelNames[i];
+        const ImVec2 nameSize = ImGui::CalcTextSize(name);
+        const float nameX = colStartX + (colWidth - nameSize.x) * 0.5f;
+        drawList->AddText(ImVec2(nameX, startPos.y), IM_COL32(33, 191, 217, 255), name);
 
-        // Draw meter background
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const ImVec2 bgMin = p;
-        const ImVec2 bgMax = ImVec2(p.x + barWidth, p.y + meterHeight);
+        // 2. Meter Bar Background (Centered statically in colWidth)
+        const float barX = colStartX + (colWidth - barWidth) * 0.5f;
+        const ImVec2 bgMin = ImVec2(barX, meterTopY);
+        const ImVec2 bgMax = ImVec2(barX + barWidth, meterBottomY);
 
         drawList->AddRectFilled(bgMin, bgMax, IM_COL32(20, 24, 30, 255), 4.0f);
         drawList->AddRect(bgMin, bgMax, IM_COL32(40, 48, 58, 255), 4.0f);
 
-        // Fill active level
+        // 3. Fill active level
         if (norm > 0.01f) {
             const float filledHeight = norm * meterHeight;
-            const ImVec2 fillMin = ImVec2(p.x + 2, bgMax.y - filledHeight);
+            const ImVec2 fillMin = ImVec2(barX + 2, bgMax.y - filledHeight);
             const ImVec2 fillMax = ImVec2(bgMax.x - 2, bgMax.y - 2);
 
-            // Three-color gradient / segment styling
             ImU32 colTop = IM_COL32(32, 226, 128, 255);    // Green
             ImU32 colBottom = IM_COL32(20, 180, 100, 255);
             if (db > -3.0f) {
@@ -625,29 +639,36 @@ void DrawSpeakerVUMeters(bool isRunning) {
             drawList->AddRectFilledMultiColor(fillMin, fillMax, colTop, colTop, colBottom, colBottom);
         }
 
-        // Draw peak-hold line
+        // 4. Peak-hold line
         const float holdDb = (g_peakHold[i] > 0.0001f) ? (20.0f * std::log10(g_peakHold[i])) : -60.0f;
         const float holdNorm = std::clamp((holdDb + 60.0f) / 60.0f, 0.0f, 1.0f);
         if (holdNorm > 0.02f) {
             const float holdY = bgMax.y - (holdNorm * meterHeight);
-            drawList->AddLine(ImVec2(p.x + 1, holdY), ImVec2(bgMax.x - 1, holdY),
+            drawList->AddLine(ImVec2(barX + 1, holdY), ImVec2(bgMax.x - 1, holdY),
                               IM_COL32(255, 255, 255, 220), 1.5f);
         }
 
-        ImGui::Dummy(ImVec2(barWidth, meterHeight));
-
-        // dB text label
+        // 5. dB text label (Centered statically in colWidth)
+        char dbText[16];
+        ImU32 textColor = IM_COL32(235, 240, 245, 255);
         if (g_channelMute[i]) {
-            ImGui::TextColored(ImVec4(0.8f, 0.3f, 0.3f, 1.0f), "MUTE");
+            strcpy_s(dbText, "MUTE");
+            textColor = IM_COL32(220, 80, 80, 255);
         } else if (db <= -59.5f) {
-            ImGui::TextDisabled("-inf");
+            strcpy_s(dbText, "-inf");
+            textColor = IM_COL32(130, 140, 150, 255);
         } else {
-            ImGui::Text("%.1f", db);
+            snprintf(dbText, sizeof(dbText), "%.1f", db);
         }
-
-        ImGui::EndGroup();
+        const ImVec2 textSize = ImGui::CalcTextSize(dbText);
+        const float textX = colStartX + (colWidth - textSize.x) * 0.5f;
+        drawList->AddText(ImVec2(textX, textY), textColor, dbText);
     }
-    ImGui::PopStyleVar();
+
+    // Advance cursor past the entire static meter block
+    const float totalWidth = 6.0f * colWidth + 5.0f * colSpacing;
+    const float totalHeight = (textY + headerH + 6.0f) - startPos.y;
+    ImGui::Dummy(ImVec2(totalWidth, totalHeight));
 }
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -883,12 +904,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
         // --- 3. Audio Routing & Hardware Configuration ---
         if (ImGui::CollapsingHeader("AUDIO ROUTING & FORMAT", ImGuiTreeNodeFlags_DefaultOpen)) {
+            // Loopback Capture Toggle
+            if (ImGui::Checkbox("WASAPI Loopback Capture (Play to CABLE Input, capture directly)", &g_loopback)) {
+                g_configDirty = true;
+                const auto& newDevs = g_loopback ? g_renderDevices : g_captureDevices;
+                g_selectedInDevice = FindDeviceBySubstring(newDevs, g_loopback ? "CABLE Input" : "CABLE Output");
+                if (g_selectedInDevice < 0 && !newDevs.empty()) g_selectedInDevice = 0;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(g_loopback ? "(Captures Playback device, e.g. CABLE Input)" : "(Captures Recording endpoint, e.g. Mics / CABLE Output)");
+
             const auto& inDevs = g_loopback ? g_renderDevices : g_captureDevices;
 
             // Input Device
             std::string inCurrentName = (g_selectedInDevice >= 0 && static_cast<size_t>(g_selectedInDevice) < inDevs.size())
                 ? ToUtf8(inDevs[static_cast<size_t>(g_selectedInDevice)].name) : "Select Input...";
-            if (ImGui::BeginCombo("Input Device", inCurrentName.c_str())) {
+            const char* inComboLabel = g_loopback ? "Input Device (Playback / Loopback)" : "Input Device (Recording / Mic)";
+            if (ImGui::BeginCombo(inComboLabel, inCurrentName.c_str())) {
                 for (int i = 0; i < static_cast<int>(inDevs.size()); ++i) {
                     const bool isSel = (g_selectedInDevice == i);
                     if (ImGui::Selectable(ToUtf8(inDevs[static_cast<size_t>(i)].name).c_str(), isSel)) {
@@ -901,12 +933,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             }
 
             // Output S/PDIF Device
-            std::string outCurrentName = (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
-                ? ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].name) : "Select Output...";
+            std::string outCurrentName = g_outAutoSpdif
+                ? "[Auto-Detect First S/PDIF Optical Port] (out_spdif=1)"
+                : ((g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
+                    ? ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].name) : "Select Output...");
             if (ImGui::BeginCombo("Digital Output (S/PDIF)", outCurrentName.c_str())) {
+                const bool isAutoSel = g_outAutoSpdif;
+                if (ImGui::Selectable("[Auto-Detect First S/PDIF Optical Port] (Recommended)", isAutoSel)) {
+                    g_outAutoSpdif = true;
+                    g_configDirty = true;
+                }
+                if (isAutoSel) ImGui::SetItemDefaultFocus();
+
+                ImGui::Separator();
+
                 for (int i = 0; i < static_cast<int>(g_renderDevices.size()); ++i) {
-                    const bool isSel = (g_selectedOutDevice == i);
+                    const bool isSel = (!g_outAutoSpdif && g_selectedOutDevice == i);
                     if (ImGui::Selectable(ToUtf8(g_renderDevices[static_cast<size_t>(i)].name).c_str(), isSel)) {
+                        g_outAutoSpdif = false;
                         g_selectedOutDevice = i;
                         g_configDirty = true;
                     }
@@ -928,7 +972,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
             // Bitrates
             if (g_outputMode == 0) { // DTS
-                const char* dtsRates[] = { "1536 kbps (Full-Rate Core - Samsung HT-DB750 Recommended)", "768 kbps (Half-Rate Core - Standard DVD)" };
+                const char* dtsRates[] = { "1536 kbps (Full-Rate Core - Maximum Fidelity)", "768 kbps (Half-Rate Core - High Compatibility)" };
                 if (ImGui::Combo("DTS Bitrate", &g_dtsBitrate, dtsRates, IM_ARRAYSIZE(dtsRates))) {
                     g_configDirty = true;
                 }
