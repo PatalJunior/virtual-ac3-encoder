@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -35,8 +36,10 @@ public:
   SpdifEncoder(const SpdifEncoder&) = delete;
   SpdifEncoder& operator=(const SpdifEncoder&) = delete;
 
-  // Stereo->5.1 upmix mode. Only applies when the input has <= 2 channels; multichannel
-  // input is always downmixed to 5.1 (by swr) regardless.
+  // Stereo->5.1 upmix mode. For <=2ch input, applies directly. For multichannel input
+  // (e.g. 5.1 cable), "Surround" triggers dynamic detection: if only FL+FR carry signal
+  // (stereo source padded by Windows), the stereo content is upmixed; otherwise
+  // multichannel content passes through via swr.
   enum class Upmix
   {
     Off,       // swr default rematrix (front channels only-ish)
@@ -82,6 +85,10 @@ private:
   bool FeedFilter(const uint8_t* in);  // push one input packet, drain output into fifo_
   int  EncodeFrameToBurst(uint8_t* outBuf, int outSize); // frame_ -> AC3 -> IEC61937
 
+  // Dynamic upmix helpers: detect stereo content in a multichannel stream and extract FL+FR.
+  bool IsEffectivelyStereo(const uint8_t* in) const;
+  void ExtractStereo(const uint8_t* in, uint8_t* out) const;
+
   AVCodecContext*  codecCtx_ = nullptr;
   AVFormatContext* muxer_    = nullptr;
   SwrContext*      swr_      = nullptr;
@@ -95,6 +102,14 @@ private:
   AVFilterContext* fsink_     = nullptr; // abuffersink
   AVAudioFifo*     fifo_      = nullptr; // accumulates filtered 5.1 fltp samples
   AVFrame*         filtFrame_ = nullptr; // scratch for draining the sink
+
+  // Dynamic upmix: input is multichannel (e.g. 5.1 cable) but we detect at runtime
+  // whether the content is actually stereo (non-FL/FR channels silent) and upmix it.
+  // Both the filter graph (stereo input) and swr (multichannel passthrough) stay live.
+  bool             dynamicUpmix_ = false;
+  mutable bool     effectivelyStereo_ = true;
+  AVChannelLayout  filterInLayout_{}; // layout fed to the filter graph (stereo in dynamic mode)
+  std::vector<uint8_t> stereoExtract_; // buffer for extracted FL+FR frames
 
   AVChannelLayout  inLayout_{};
   AVSampleFormat   inSampleFmt_ = AV_SAMPLE_FMT_FLT;

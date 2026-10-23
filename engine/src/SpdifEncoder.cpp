@@ -2,6 +2,7 @@
 
 #include "SpdifEncoder.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -82,16 +83,43 @@ bool SpdifEncoder::Init(const Params& p)
   if (rc < 0) { LogAv("av_frame_get_buffer", rc); return false; }
 
   // Input conditioning: either the `surround` upmix filter (stereo->5.1) or plain swr
-  // convert/downmix. Surround only applies to <= 2ch input; multichannel always downmixes.
-  useFilter_ = (p.upmix == Upmix::Surround && inLayout_.nb_channels <= 2);
-  if (useFilter_ && !BuildFilterGraph())
+  // convert/downmix. When input is already multichannel but upmix is requested, use
+  // "dynamic" mode: keep both paths live and detect stereo content at runtime.
+  const bool wantUpmix = (p.upmix == Upmix::Surround);
+  useFilter_ = (wantUpmix && inLayout_.nb_channels <= 2);
+  dynamicUpmix_ = (wantUpmix && inLayout_.nb_channels > 2);
+
+  if (useFilter_)
   {
-    std::fprintf(stderr, "[SpdifEncoder] surround upmix unavailable; using plain upmix/downmix\n");
-    useFilter_ = false;
+    av_channel_layout_copy(&filterInLayout_, &inLayout_);
+    if (!BuildFilterGraph())
+    {
+      std::fprintf(stderr, "[SpdifEncoder] surround upmix unavailable; using plain upmix/downmix\n");
+      useFilter_ = false;
+      av_channel_layout_uninit(&filterInLayout_);
+    }
+  }
+  if (dynamicUpmix_)
+  {
+    // Build filter graph expecting stereo input (we extract FL+FR at runtime).
+    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    av_channel_layout_copy(&filterInLayout_, &stereo);
+    if (!BuildFilterGraph())
+    {
+      std::fprintf(stderr, "[SpdifEncoder] dynamic upmix unavailable; multichannel passthrough only\n");
+      dynamicUpmix_ = false;
+      av_channel_layout_uninit(&filterInLayout_);
+    }
+    else
+    {
+      const int bps = av_get_bytes_per_sample(inSampleFmt_);
+      stereoExtract_.resize(static_cast<size_t>(framesPerPacket_) * 2 * bps);
+    }
   }
   if (!useFilter_)
   {
     // swr: interleaved input -> planar-float 5.1 (encoder layout), same sample rate.
+    // Also used as the multichannel fallback path in dynamic upmix mode.
     rc = swr_alloc_set_opts2(&swr_, &codecCtx_->ch_layout, AV_SAMPLE_FMT_FLTP, sampleRate_,
                              &inLayout_, inSampleFmt_, sampleRate_, 0, nullptr);
     if (rc < 0 || !swr_) { LogAv("swr_alloc_set_opts2", rc); return false; }
@@ -146,6 +174,10 @@ void SpdifEncoder::Close()
   if (fifo_)      { av_audio_fifo_free(fifo_); fifo_ = nullptr; }
   if (filtFrame_) av_frame_free(&filtFrame_);
   useFilter_ = false;
+  dynamicUpmix_ = false;
+  effectivelyStereo_ = true;
+  av_channel_layout_uninit(&filterInLayout_);
+  stereoExtract_.clear();
   if (swr_)       swr_free(&swr_);
   if (frame_)     av_frame_free(&frame_);
   if (pkt_)       av_packet_free(&pkt_);
@@ -161,7 +193,7 @@ bool SpdifEncoder::BuildFilterGraph()
   if (!graph_) return false;
 
   char inDesc[64] = {0}, outDesc[64] = {0};
-  av_channel_layout_describe(&inLayout_, inDesc, sizeof inDesc);
+  av_channel_layout_describe(&filterInLayout_, inDesc, sizeof inDesc);
   av_channel_layout_describe(&codecCtx_->ch_layout, outDesc, sizeof outDesc);
 
   const AVFilter* abuffer = avfilter_get_by_name("abuffer");
@@ -211,25 +243,27 @@ bool SpdifEncoder::BuildFilterGraph()
   // Prime with silence to warm the FFT and build a >= 2-packet cushion, so the real-time
   // consumer doesn't starve mid-stream (the filter has inherent FFT latency).
   const int inBytes =
-      framesPerPacket_ * inLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
+      framesPerPacket_ * filterInLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
   std::vector<uint8_t> silence(static_cast<size_t>(inBytes), 0);
   for (int guard = 0; guard < 64 && av_audio_fifo_size(fifo_) < 2 * framesPerPacket_; ++guard)
     if (!FeedFilter(silence.data()))
       break;
 
-  std::printf("[SpdifEncoder] surround upmix enabled (%s -> %s)\n", inDesc, outDesc);
+  std::printf("[SpdifEncoder] surround upmix enabled%s (%s -> %s)\n",
+              dynamicUpmix_ ? " (dynamic: auto-detect stereo in multichannel)" : "",
+              inDesc, outDesc);
   return true;
 }
 
 bool SpdifEncoder::FeedFilter(const uint8_t* in)
 {
   const int inBytes =
-      framesPerPacket_ * inLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
+      framesPerPacket_ * filterInLayout_.nb_channels * av_get_bytes_per_sample(inSampleFmt_);
 
   AVFrame* f = av_frame_alloc();
   if (!f) return false;
   f->format = inSampleFmt_;
-  av_channel_layout_copy(&f->ch_layout, &inLayout_);
+  av_channel_layout_copy(&f->ch_layout, &filterInLayout_);
   f->sample_rate = sampleRate_;
   f->nb_samples = framesPerPacket_;
   if (av_frame_get_buffer(f, 0) < 0) { av_frame_free(&f); return false; }
@@ -274,6 +308,44 @@ int SpdifEncoder::EncodePacket(const uint8_t* in, uint8_t* outBuf, int outSize)
     if (av_audio_fifo_read(fifo_, reinterpret_cast<void**>(frame_->data), framesPerPacket_) <
         framesPerPacket_)
       return 0;
+  }
+  else if (dynamicUpmix_)
+  {
+    // Multichannel input with dynamic stereo detection. Always feed the filter graph with
+    // extracted FL+FR to keep it primed; choose at runtime whether to use its output (stereo
+    // content padded to multichannel) or the swr multichannel passthrough.
+    ExtractStereo(in, stereoExtract_.data());
+    if (!FeedFilter(stereoExtract_.data()))
+      return -1;
+
+    if (IsEffectivelyStereo(in))
+    {
+      // Non-FL/FR channels are silent → upmix stereo content to 5.1.
+      // Cap FIFO growth (keep at most ~3 packets ahead).
+      const int excess = av_audio_fifo_size(fifo_) - 3 * framesPerPacket_;
+      if (excess > 0)
+        av_audio_fifo_drain(fifo_, excess);
+      if (av_audio_fifo_size(fifo_) < framesPerPacket_)
+        return 0;
+      if (av_frame_make_writable(frame_) < 0)
+        return -1;
+      if (av_audio_fifo_read(fifo_, reinterpret_cast<void**>(frame_->data), framesPerPacket_) <
+          framesPerPacket_)
+        return 0;
+    }
+    else
+    {
+      // Real multichannel content (e.g. Netflix 5.1) → pass through via swr.
+      // Drain FIFO to prevent unbounded growth but keep it primed for switching back.
+      const int excess = av_audio_fifo_size(fifo_) - 2 * framesPerPacket_;
+      if (excess > 0)
+        av_audio_fifo_drain(fifo_, excess);
+      if (av_frame_make_writable(frame_) < 0)
+        return -1;
+      const uint8_t* inPlanes[1] = { in };
+      int got = swr_convert(swr_, frame_->data, frame_->nb_samples, inPlanes, framesPerPacket_);
+      if (got < 0) { LogAv("swr_convert", got); return -1; }
+    }
   }
   else
   {
@@ -320,6 +392,91 @@ int SpdifEncoder::EncodeFrameToBurst(uint8_t* outBuf, int outSize)
 int SpdifEncoder::WritePacketThunk(void* opaque, const uint8_t* buf, int buf_size)
 {
   return static_cast<SpdifEncoder*>(opaque)->OnWritePacket(buf, buf_size);
+}
+
+bool SpdifEncoder::IsEffectivelyStereo(const uint8_t* in) const
+{
+  const int ch = inLayout_.nb_channels;
+  if (ch <= 2)
+    return true;
+
+  // Measure RMS energy of non-FL/FR channels vs front channels.
+  // If non-front channels are below ~-60 dB, the stream is effectively stereo padded to
+  // multichannel by Windows. If all channels are silent, preserve the current mode so
+  // pauses in movies or songs don't cause mode flutter.
+  double frontSumSq = 0.0;
+  double otherSumSq = 0.0;
+
+  if (inSampleFmt_ == AV_SAMPLE_FMT_FLT)
+  {
+    const float* f = reinterpret_cast<const float*>(in);
+    for (int i = 0; i < framesPerPacket_; ++i)
+    {
+      const float l = f[i * ch + 0];
+      const float r = f[i * ch + 1];
+      frontSumSq += l * l + r * r;
+      for (int c = 2; c < ch; ++c)
+      {
+        const float v = f[i * ch + c];
+        otherSumSq += v * v;
+      }
+    }
+  }
+  else if (inSampleFmt_ == AV_SAMPLE_FMT_S16)
+  {
+    const int16_t* s = reinterpret_cast<const int16_t*>(in);
+    for (int i = 0; i < framesPerPacket_; ++i)
+    {
+      const double l = s[i * ch + 0] / 32768.0;
+      const double r = s[i * ch + 1] / 32768.0;
+      frontSumSq += l * l + r * r;
+      for (int c = 2; c < ch; ++c)
+      {
+        const double v = s[i * ch + c] / 32768.0;
+        otherSumSq += v * v;
+      }
+    }
+  }
+  else if (inSampleFmt_ == AV_SAMPLE_FMT_S32)
+  {
+    const int32_t* s = reinterpret_cast<const int32_t*>(in);
+    for (int i = 0; i < framesPerPacket_; ++i)
+    {
+      const double l = s[i * ch + 0] / 2147483648.0;
+      const double r = s[i * ch + 1] / 2147483648.0;
+      frontSumSq += l * l + r * r;
+      for (int c = 2; c < ch; ++c)
+      {
+        const double v = s[i * ch + c] / 2147483648.0;
+        otherSumSq += v * v;
+      }
+    }
+  }
+
+  const double otherRms = std::sqrt(otherSumSq / (framesPerPacket_ * (ch - 2)));
+  if (otherRms >= 0.001) // ~-60 dB: non-stereo channels have real signal -> definitely multichannel
+  {
+    effectivelyStereo_ = false;
+    return false;
+  }
+
+  const double frontRms = std::sqrt(frontSumSq / (framesPerPacket_ * 2));
+  if (frontRms < 0.001) // both front and surrounds silent -> preserve current mode
+    return effectivelyStereo_;
+
+  effectivelyStereo_ = true;
+  return true;
+}
+
+void SpdifEncoder::ExtractStereo(const uint8_t* in, uint8_t* out) const
+{
+  const int ch = inLayout_.nb_channels;
+  const int bps = av_get_bytes_per_sample(inSampleFmt_);
+  const int inStride = ch * bps;
+  const int outStride = 2 * bps;
+
+  for (int i = 0; i < framesPerPacket_; ++i)
+    std::memcpy(out + i * outStride, in + i * inStride, static_cast<size_t>(outStride));
 }
 
 int SpdifEncoder::OnWritePacket(const uint8_t* buf, int buf_size)
