@@ -38,9 +38,13 @@ Source: "{#SourceDir}\scripts\*";         DestDir: "{app}\scripts"; Flags: ignor
 ; Don't overwrite the user's settings on upgrade:
 Source: "{#SourceDir}\virtual-ac3-encoder.conf"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
+[InstallDelete]
+; Remove legacy supervisor startup shortcut from earlier versions
+Type: files; Name: "{userstartup}\Virtual AC3 Encoder.lnk"
+
 [Icons]
-; Autostart hidden at logon via the self-locating supervisor:
-Name: "{userstartup}\Virtual AC3 Encoder"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\supervisor.vbs"""; WorkingDir: "{app}"
+; Autostart minimized to system tray at logon:
+Name: "{userstartup}\Virtual AC3 Control Center"; Filename: "{app}\control_center.exe"; Parameters: "--minimized"; WorkingDir: "{app}"
 ; Start Menu:
 Name: "{group}\Control Center";        Filename: "{app}\control_center.exe"; WorkingDir: "{app}"
 Name: "{group}\Edit config";        Filename: "{win}\notepad.exe"; Parameters: """{app}\virtual-ac3-encoder.conf"""
@@ -52,13 +56,15 @@ Name: "{group}\Project page";       Filename: "https://github.com/strepto42/virt
 Name: "{group}\Uninstall Virtual AC3 Encoder"; Filename: "{uninstallexe}"
 
 [Run]
-; Start it now (hidden); then offer the quick start (VB-CABLE setup).
-Filename: "{sys}\wscript.exe"; Parameters: """{app}\supervisor.vbs"""; WorkingDir: "{app}"; Flags: nowait runhidden
-Filename: "{app}\QUICKSTART.txt"; Description: "Open the quick start (VB-CABLE setup)"; Flags: postinstall shellexec skipifsilent
+; Launch the Control Center automatically upon installation:
+Filename: "{app}\control_center.exe"; Description: "Launch Virtual AC3 Control Center"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\QUICKSTART.txt"; Description: "Open the quick start (VB-CABLE setup)"; Flags: postinstall shellexec skipifsilent unchecked
 
 [UninstallRun]
-; Stop the running engine + supervisor before files are removed.
+; Stop the running engine + control center before files are removed.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\stop-engine.ps1"""; Flags: runhidden; RunOnceId: "StopEngine"
 
 [UninstallDelete]
 Type: files; Name: "{app}\engine.log"
+Type: files; Name: "{app}\ac3-control.ini"
+Type: files; Name: "{userstartup}\Virtual AC3 Control Center.lnk"

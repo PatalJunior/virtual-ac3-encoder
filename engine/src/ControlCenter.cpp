@@ -6,6 +6,7 @@
 #include <dxgi.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
@@ -53,6 +54,7 @@ bool                    g_trayBalloonShown = false;
 
 // Process & File paths
 PROCESS_INFORMATION g_engine{};
+bool g_engineEnabled = true;
 std::wstring g_exeDir;
 std::wstring g_configPath;
 std::wstring g_controlPath;
@@ -241,20 +243,37 @@ bool EngineRunning() {
     return code == STILL_ACTIVE;
 }
 
-void StopEngine() {
-    if (!g_engine.hProcess) {
-        WriteControlFile(false);
-        return;
+void KillOrphanedEngineProcesses() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"engine.exe") == 0) {
+                if (g_engine.hProcess && pe.th32ProcessID == g_engine.dwProcessId) continue;
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    TerminateProcess(hProc, 0);
+                    CloseHandle(hProc);
+                }
+            }
+        } while (Process32NextW(snap, &pe));
     }
-    if (EngineRunning()) {
+    CloseHandle(snap);
+}
+
+void StopEngine() {
+    if (g_engine.hProcess && EngineRunning()) {
         WriteControlFile(true); // Signal graceful stop
-        DWORD wait = WaitForSingleObject(g_engine.hProcess, 2000);
+        DWORD wait = WaitForSingleObject(g_engine.hProcess, 1500);
         if (wait == WAIT_TIMEOUT) {
             TerminateProcess(g_engine.hProcess, 3);
             WaitForSingleObject(g_engine.hProcess, 1000);
         }
     }
     CloseProcessHandles();
+    KillOrphanedEngineProcesses();
     WriteControlFile(false);
 }
 
@@ -654,10 +673,17 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetForegroundWindow(hWnd);
             break;
         case ID_TRAY_TOGGLE:
-            if (EngineRunning()) StopEngine();
-            else StartEngine();
+            if (EngineRunning()) {
+                g_engineEnabled = false;
+                StopEngine();
+            } else {
+                g_engineEnabled = true;
+                SaveConfiguration();
+                StartEngine();
+            }
             break;
         case ID_TRAY_EXIT:
+            g_engineEnabled = false;
             StopEngine();
             DestroyWindow(hWnd);
             break;
@@ -705,6 +731,18 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
+    HANDLE hSingleInstanceMutex = CreateMutexW(nullptr, FALSE, L"Local\\VirtualAc3DtsControlCenter_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existingWnd = FindWindowW(L"VirtualAc3DtsControlCenter", nullptr);
+        if (existingWnd) {
+            ShowWindow(existingWnd, SW_SHOW);
+            ShowWindow(existingWnd, SW_RESTORE);
+            SetForegroundWindow(existingWnd);
+        }
+        if (hSingleInstanceMutex) CloseHandle(hSingleInstanceMutex);
+        return 0;
+    }
+
     g_exeDir = ExeDirectory();
     g_configPath = g_exeDir + L"\\virtual-ac3-encoder.conf";
     g_controlPath = g_exeDir + L"\\ac3-control.ini";
@@ -766,6 +804,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
     }
 
     auto lastCheck = std::chrono::steady_clock::now();
+    auto lastRestartAttempt = std::chrono::steady_clock::now();
 
     // Main render loop
     bool done = false;
@@ -779,11 +818,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
         }
         if (done) break;
 
-        // Periodic check (every 500 ms) for shared memory reconnection
+        // Periodic check (every 500 ms) for shared memory reconnection and auto-supervision
         const auto now = std::chrono::steady_clock::now();
         if (now - lastCheck >= std::chrono::milliseconds(500)) {
             lastCheck = now;
             if (!g_meterMem.IsOpen()) g_meterMem.OpenConsumer();
+            if (g_engineEnabled && !EngineRunning()) {
+                if (now - lastRestartAttempt >= std::chrono::seconds(4)) {
+                    lastRestartAttempt = now;
+                    StartEngine();
+                }
+            }
         }
 
         const bool isRunning = EngineRunning();
@@ -808,6 +853,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.75f, 0.45f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.10f, 0.55f, 0.35f, 1.0f));
             if (ImGui::Button("[ ACTIVE: ENCODING TO S/PDIF ]  (Click to Disable & Release Port)", ImVec2(-1, 38))) {
+                g_engineEnabled = false;
                 StopEngine();
             }
             ImGui::PopStyleColor(3);
@@ -816,6 +862,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.22f, 0.25f, 0.30f, 1.0f));
             if (ImGui::Button("[ DISABLED: S/PDIF RELEASED ]  (Click to Enable Encoding)", ImVec2(-1, 38))) {
+                g_engineEnabled = true;
                 SaveConfiguration();
                 StartEngine();
             }
@@ -1005,6 +1052,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
     CleanupDeviceD3D();
     DestroyWindow(g_hWnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    if (hSingleInstanceMutex) CloseHandle(hSingleInstanceMutex);
     CoUninitialize();
 
     return 0;

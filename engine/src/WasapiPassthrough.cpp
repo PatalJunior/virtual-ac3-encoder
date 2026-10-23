@@ -249,7 +249,16 @@ bool WasapiPassthrough::InitExclusive(int rate)
 
   if (FAILED(hr))
   {
-    std::fprintf(stderr, "[WasapiPassthrough] exclusive Initialize failed: %s\n", HrStr(hr).c_str());
+    if (hr == static_cast<HRESULT>(0x8889000A))
+    {
+      std::fprintf(stderr,
+                   "[WasapiPassthrough] exclusive Initialize failed: 0x8889000a (AUDCLNT_E_DEVICE_IN_USE).\n"
+                   "  -> Device in use by another exclusive application or duplicate engine instance.\n");
+    }
+    else
+    {
+      std::fprintf(stderr, "[WasapiPassthrough] exclusive Initialize failed: %s\n", HrStr(hr).c_str());
+    }
     return false;
   }
 
