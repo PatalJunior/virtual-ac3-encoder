@@ -67,16 +67,13 @@ stage_ffmpeg_dlls(encode_wav)
 # ---------------------------------------------------------------------------
 # Phase 2 live engine: WASAPI capture -> ring -> AC3 exclusive passthrough
 # ---------------------------------------------------------------------------
-# Icon & Resource configuration for Windows
-set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/app.ico")
-file(TO_NATIVE_PATH "${APP_ICON_PATH}" APP_ICON_NATIVE)
-string(REPLACE "\\" "\\\\" APP_ICON_ESCAPED "${APP_ICON_NATIVE}")
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/app.rc.in"
-               "${CMAKE_CURRENT_BINARY_DIR}/generated/app.rc" @ONLY)
+set_source_files_properties(src/app.rc PROPERTIES
+  INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
 
 add_executable(engine
   src/main.cpp
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/app.rc"
+  src/app.rc
   src/Config.h
   src/ComUtil.cpp
   src/ComUtil.h
@@ -99,7 +96,10 @@ endif()
 set(VAC3_VERSION "0.0.0-dev" CACHE STRING "Engine version string")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/Version.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/Version.h" @ONLY)
-target_include_directories(engine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_include_directories(engine PRIVATE
+  src
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
 stage_ffmpeg_dlls(engine)
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ stage_ffmpeg_dlls(engine)
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/imgui")
 add_executable(control_center WIN32
   src/ControlCenter.cpp
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/app.rc"
+  src/app.rc
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_draw.cpp"
   "${IMGUI_DIR}/imgui_tables.cpp"
@@ -118,6 +118,7 @@ add_executable(control_center WIN32
 )
 target_include_directories(control_center PRIVATE
   src
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
   "${IMGUI_DIR}"
   "${IMGUI_DIR}/backends"
 )
