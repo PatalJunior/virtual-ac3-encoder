@@ -69,6 +69,7 @@ stage_ffmpeg_dlls(encode_wav)
 # ---------------------------------------------------------------------------
 add_executable(engine
   src/main.cpp
+  src/app.rc
   src/Config.h
   src/ComUtil.cpp
   src/ComUtil.h
@@ -100,6 +101,7 @@ stage_ffmpeg_dlls(engine)
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/imgui")
 add_executable(control_center WIN32
   src/ControlCenter.cpp
+  src/app.rc
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_draw.cpp"
   "${IMGUI_DIR}/imgui_tables.cpp"

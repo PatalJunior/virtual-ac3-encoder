@@ -85,7 +85,7 @@ jobs:
           }
           Copy-Item scripts/*.ps1 "$d/scripts"
           Copy-Item README.md,LICENSE,NOTICE.md,CLAUDE.md $d
-          Copy-Item installer/supervisor.vbs,installer/stop-engine.ps1 $d
+          Copy-Item installer/supervisor.vbs,installer/stop-engine.ps1,installer/app.ico $d
           Copy-Item installer/quickstart.txt "$d/QUICKSTART.txt"
           Copy-Item installer/default.conf "$d/virtual-ac3-encoder.conf"
 

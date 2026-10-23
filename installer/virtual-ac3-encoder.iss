@@ -21,6 +21,7 @@ DisableProgramGroupPage=yes
 WizardStyle=modern
 Compression=lzma2
 SolidCompression=yes
+SetupIconFile=app.ico
 OutputBaseFilename=virtual-ac3-encoder-setup-{#AppVersion}
 UninstallDisplayName=Virtual AC3 Encoder {#AppVersion}
 
@@ -28,6 +29,7 @@ UninstallDisplayName=Virtual AC3 Encoder {#AppVersion}
 Source: "{#SourceDir}\engine.exe";        DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\control_center.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceDir}\*.dll";             DestDir: "{app}"; Flags: ignoreversion
+Source: "app.ico";                        DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\supervisor.vbs";    DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\stop-engine.ps1";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\QUICKSTART.txt";    DestDir: "{app}"; Flags: ignoreversion
@@ -44,16 +46,16 @@ Type: files; Name: "{userstartup}\Virtual AC3 Encoder.lnk"
 
 [Icons]
 ; Autostart minimized to system tray at logon:
-Name: "{userstartup}\Virtual AC3 Control Center"; Filename: "{app}\control_center.exe"; Parameters: "--minimized"; WorkingDir: "{app}"
+Name: "{userstartup}\Virtual AC3 Control Center"; Filename: "{app}\control_center.exe"; Parameters: "--minimized"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"
 ; Start Menu:
-Name: "{group}\Control Center";        Filename: "{app}\control_center.exe"; WorkingDir: "{app}"
+Name: "{group}\Control Center";        Filename: "{app}\control_center.exe"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"
 Name: "{group}\Edit config";        Filename: "{win}\notepad.exe"; Parameters: """{app}\virtual-ac3-encoder.conf"""
 Name: "{group}\View log";           Filename: "{win}\notepad.exe"; Parameters: """{app}\engine.log"""
 Name: "{group}\List audio devices"; Filename: "{cmd}"; Parameters: "/k """"{app}\engine.exe"""" --list"
 Name: "{group}\Quick start";        Filename: "{app}\QUICKSTART.txt"
 Name: "{group}\Get VB-CABLE (required virtual cable)"; Filename: "https://vb-audio.com/Cable/"
 Name: "{group}\Project page";       Filename: "https://github.com/strepto42/virtual-ac3-encoder"
-Name: "{group}\Uninstall Virtual AC3 Encoder"; Filename: "{uninstallexe}"
+Name: "{group}\Uninstall Virtual AC3 Encoder"; Filename: "{uninstallexe}"; IconFilename: "{app}\app.ico"
 
 [Run]
 ; Launch the Control Center automatically upon installation:
@@ -67,4 +69,5 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 [UninstallDelete]
 Type: files; Name: "{app}\engine.log"
 Type: files; Name: "{app}\ac3-control.ini"
+Type: files; Name: "{app}\app.ico"
 Type: files; Name: "{userstartup}\Virtual AC3 Control Center.lnk"

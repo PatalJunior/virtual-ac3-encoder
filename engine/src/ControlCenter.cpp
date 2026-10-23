@@ -50,7 +50,6 @@ IDXGISwapChain*         g_pSwapChain = nullptr;
 ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 HWND                    g_hWnd = nullptr;
 NOTIFYICONDATAW         g_notifyIconData{};
-bool                    g_trayBalloonShown = false;
 
 // Process & File paths
 PROCESS_INFORMATION g_engine{};
@@ -425,8 +424,10 @@ void InitTrayIcon(HWND hwnd) {
     g_notifyIconData.uID = 1;
     g_notifyIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_notifyIconData.uCallbackMessage = WM_TRAYICON;
-    g_notifyIconData.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_notifyIconData.szTip, L"Virtual AC3/DTS Encoder");
+    HICON hIcon = LoadIcon(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
+    if (!hIcon) hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    g_notifyIconData.hIcon = hIcon;
+    wcscpy_s(g_notifyIconData.szTip, L"Virtual AC3 / DTS Control Center");
     Shell_NotifyIconW(NIM_ADD, &g_notifyIconData);
 }
 
@@ -714,14 +715,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_MINIMIZE) {
             ShowWindow(hWnd, SW_HIDE);
-            if (!g_trayBalloonShown) {
-                g_notifyIconData.uFlags |= NIF_INFO;
-                wcscpy_s(g_notifyIconData.szInfoTitle, L"Virtual AC3/DTS Encoder");
-                wcscpy_s(g_notifyIconData.szInfo, L"Minimized to tray. Double-click icon to open.");
-                g_notifyIconData.dwInfoFlags = NIIF_INFO;
-                Shell_NotifyIconW(NIM_MODIFY, &g_notifyIconData);
-                g_trayBalloonShown = true;
-            }
             return 0;
         }
         break;
@@ -771,9 +764,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    HICON hAppIcon = LoadIcon(hInstance, MAKEINTRESOURCEW(101));
+    if (!hAppIcon) hAppIcon = LoadIcon(nullptr, IDI_APPLICATION);
+
     WNDCLASSEXW wc = {
         sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, hInstance,
-        LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),
+        hAppIcon, LoadCursor(nullptr, IDC_ARROW),
         nullptr, nullptr, L"VirtualAc3DtsControlCenter", nullptr
     };
     RegisterClassExW(&wc);
@@ -788,6 +784,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
     g_hWnd = CreateWindowW(wc.lpszClassName, L"Virtual AC3 / DTS Control Center",
                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                            posX, posY, winWidth, winHeight, nullptr, nullptr, wc.hInstance, nullptr);
+
+    if (hAppIcon && g_hWnd) {
+        SendMessageW(g_hWnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
+        SendMessageW(g_hWnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hAppIcon));
+    }
 
     if (!CreateDeviceD3D(g_hWnd)) {
         CleanupDeviceD3D();
