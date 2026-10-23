@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>

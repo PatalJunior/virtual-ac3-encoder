@@ -2,6 +2,7 @@
 
 #include "SpdifEncoder.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
