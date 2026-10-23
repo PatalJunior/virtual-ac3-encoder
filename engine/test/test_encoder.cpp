@@ -23,10 +23,14 @@ bool HasIec61937Sync(const uint8_t* b)
 }
 
 // Helper: init an encoder for `channels` interleaved samples in `fmt`.
-bool InitFor(SpdifEncoder& enc, int channels, AVSampleFormat fmt, int rate = 48000)
+bool InitFor(SpdifEncoder& enc, int channels, AVSampleFormat fmt, int rate = 48000,
+             SpdifEncoder::Codec codec = SpdifEncoder::Codec::AC3,
+             int64_t dtsBitRate = 1536000)
 {
   SpdifEncoder::Params p;
+  p.codec = codec;
   p.sampleRate = rate;
+  p.dtsBitRate = dtsBitRate;
   p.inSampleFmt = fmt;
   av_channel_layout_default(&p.inLayout, channels);
   bool ok = enc.Init(p);
@@ -111,6 +115,49 @@ TEST_CASE("init: AC3-invalid sample rate fails cleanly")
 {
   SpdifEncoder enc;
   CHECK_FALSE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 96000)); // AC3 supports 48/44.1/32k only
+}
+
+TEST_CASE("init: DTS 5.1 encoder (full rate 1536k and half rate 768k)")
+{
+  SpdifEncoder encFull;
+  REQUIRE(InitFor(encFull, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 1536000));
+  CHECK(encFull.IsOpen());
+  CHECK(encFull.FramesPerPacket() == 512);
+  CHECK(encFull.InChannels() == 6);
+
+  SpdifEncoder encHalf;
+  REQUIRE(InitFor(encHalf, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 768000));
+  CHECK(encHalf.IsOpen());
+  CHECK(encHalf.FramesPerPacket() == 512);
+  CHECK(encHalf.InChannels() == 6);
+}
+
+TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (full rate)")
+{
+  SpdifEncoder enc;
+  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 1536000));
+  std::vector<float> in(static_cast<size_t>(enc.FramesPerPacket()) * 6, 0.1f);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+
+  int n = enc.EncodePacket(reinterpret_cast<const uint8_t*>(in.data()), out.data(),
+                           static_cast<int>(out.size()));
+  REQUIRE(n > 0);
+  CHECK(n == 2048);
+  CHECK(HasIec61937Sync(out.data()));
+}
+
+TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (half rate)")
+{
+  SpdifEncoder enc;
+  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 768000));
+  std::vector<float> in(static_cast<size_t>(enc.FramesPerPacket()) * 6, 0.1f);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+
+  int n = enc.EncodePacket(reinterpret_cast<const uint8_t*>(in.data()), out.data(),
+                           static_cast<int>(out.size()));
+  REQUIRE(n > 0);
+  CHECK(n == 2048);
+  CHECK(HasIec61937Sync(out.data()));
 }
 
 // (The surround upmix is covered by a meaningful behavioral test in test_upmix.cpp:

@@ -1,6 +1,6 @@
 // SpdifEncoder.h
 //
-// Real-time PCM -> AC3 (Dolby Digital) -> IEC 61937 (S/PDIF) burst encoder.
+// Real-time PCM -> AC3 (Dolby Digital) or DTS Core -> IEC 61937 (S/PDIF) burst encoder.
 //
 // Ported from SoundPusher's SPDIFAudioEncoder (MIT, Daniel Vollmer) and Kodi's
 // CAEEncoderFFmpeg (GPL), modernized for FFmpeg 7.x / 8.x:
@@ -9,11 +9,12 @@
 //   - swr_alloc_set_opts2
 //
 // Design (from SoundPusher): swresample converts/downmixes the interleaved input to the
-// AC3 encoder's required planar-float 5.1 format; libavcodec encodes one 1536-frame AC3
-// packet; libavformat's "spdif" muxer wraps it into an IEC 61937 burst via a custom AVIO
-// write callback that drops the burst straight into the caller's output buffer.
+// encoder's required format; libavcodec encodes one packet; libavformat's "spdif" muxer
+// wraps it into an IEC 61937 burst via a custom AVIO write callback.
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -31,7 +32,9 @@ extern "C" {
 class SpdifEncoder
 {
 public:
-  SpdifEncoder() = default;
+  enum class Codec { AC3, DTS };
+
+  SpdifEncoder();
   ~SpdifEncoder();
   SpdifEncoder(const SpdifEncoder&) = delete;
   SpdifEncoder& operator=(const SpdifEncoder&) = delete;
@@ -48,32 +51,36 @@ public:
 
   struct Params
   {
-    int sampleRate = 48000;                       // AC3: 48000 / 44100 / 32000
-    int64_t bitRate = 640000;                     // AC3-over-optical maximum
+    Codec codec = Codec::AC3;
+    int sampleRate = 48000;                         // AC3: 48000 / 44100 / 32000; DTS: 48000
+    int64_t bitRate = 640000;                       // AC3-over-optical maximum
+    int64_t dtsBitRate = 1536000;                   // DTS: 1536000 (full-rate) or 768000 (half-rate)
     AVSampleFormat inSampleFmt = AV_SAMPLE_FMT_FLT; // interleaved input from WASAPI/WAV
-    AVChannelLayout inLayout{};                   // caller-owned; copied in Init().
-                                                  // Any layout; downmixed to 5.1 by swr.
-    Upmix upmix = Upmix::Off;                     // stereo->5.1 upmix mode
+    AVChannelLayout inLayout{};                     // caller-owned; copied in Init().
+                                                    // Any layout; downmixed to 5.1 by swr.
+    Upmix upmix = Upmix::Off;                       // stereo->5.1 upmix mode
   };
 
   // Open the encoder. Returns false (and logs to stderr) on failure.
   bool Init(const Params& p);
+  // Per-output-channel trim. Values are clamped to -60..0 dB; -60 dB is digital mute.
+  void SetChannelGainsDb(const std::array<float, 6>& gainsDb);
   void Close();
   bool IsOpen() const { return codecCtx_ != nullptr; }
 
-  // Input sample-frames consumed per EncodePacket() call (AC3 == 1536).
+  // Input sample-frames consumed per EncodePacket() call (AC3 == 1536, DTS == 512).
   int FramesPerPacket() const { return framesPerPacket_; }
   // Channels expected in the interleaved input (== inLayout.nb_channels).
   int InChannels() const { return inLayout_.nb_channels; }
 
-  // An IEC 61937 AC3 burst is always 6144 bytes (1536 frames * 2ch * 16-bit).
+  // An IEC 61937 AC3 burst is 6144 bytes; DTS burst is 2048 bytes.
   static constexpr int kMaxBytesPerPacket = 6144;
 
   // Encode exactly FramesPerPacket() interleaved input frames into one IEC 61937 burst.
   //   in      : FramesPerPacket() * InChannels() samples in Params::inSampleFmt
   //   outBuf  : destination for the S/PDIF burst
   //   outSize : capacity of outBuf (must be >= kMaxBytesPerPacket)
-  // Returns bytes written (typically 6144), 0 if the encoder produced no packet, <0 on error.
+  // Returns bytes written, 0 if the encoder produced no packet, <0 on error.
   int EncodePacket(const uint8_t* in, uint8_t* outBuf, int outSize);
 
 private:
@@ -83,7 +90,8 @@ private:
 
   bool BuildFilterGraph();              // surround-upmix path
   bool FeedFilter(const uint8_t* in);  // push one input packet, drain output into fifo_
-  int  EncodeFrameToBurst(uint8_t* outBuf, int outSize); // frame_ -> AC3 -> IEC61937
+  int  EncodeFrameToBurst(uint8_t* outBuf, int outSize);
+  void ApplyChannelGains();
 
   // Dynamic upmix helpers: detect stereo content in a multichannel stream and extract FL+FR.
   bool IsEffectivelyStereo(const uint8_t* in) const;
@@ -92,11 +100,14 @@ private:
   AVCodecContext*  codecCtx_ = nullptr;
   AVFormatContext* muxer_    = nullptr;
   SwrContext*      swr_      = nullptr;
-  AVFrame*         frame_    = nullptr;  // planar-float scratch fed to the encoder
+  SwrContext*      dtsS32Swr_ = nullptr; // FLTP to packed S32 for DTS
+  AVFrame*         frame_    = nullptr;  // planar-float processing frame
+  AVFrame*         dtsFrame_  = nullptr;  // packed S32 frame for the DTS encoder
   AVPacket*        pkt_      = nullptr;
 
   // surround-upmix pipeline (used when upmix == Surround and input is <= 2ch)
   bool             useFilter_ = false;
+  bool             useDts_ = false;
   AVFilterGraph*   graph_     = nullptr;
   AVFilterContext* fsrc_      = nullptr; // abuffer
   AVFilterContext* fsink_     = nullptr; // abuffersink
@@ -115,6 +126,7 @@ private:
   AVSampleFormat   inSampleFmt_ = AV_SAMPLE_FMT_FLT;
   int              sampleRate_ = 48000;
   int              framesPerPacket_ = 0;
+  std::array<std::atomic<float>, 6> channelGainLinear_;
   int64_t          nextPts_ = 0;
 
   // Scratch state used by OnWritePacket() during a single EncodePacket() call.
