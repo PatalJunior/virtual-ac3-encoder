@@ -32,13 +32,23 @@ jobs:
           $ver = "${{ github.event.inputs.version }}"
           if (-not $ver) {
             $latest = ""
-            try { $latest = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' } catch {}
+            try {
+              $resp = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>$null
+              if ($resp) { $latest = $resp }
+            } catch {}
+            if (-not $latest) {
+              try {
+                $resp = gh api "repos/strepto42/virtual-ac3-encoder/releases/latest" --jq '.tag_name' 2>$null
+                if ($resp) { $latest = $resp }
+              } catch {}
+            }
             if ($latest -match '^v?(\d+)\.(\d+)\.(\d+)') {
               $ver = '{0}.{1}.{2}' -f $Matches[1], $Matches[2], ([int]$Matches[3] + 1)
             } else {
-              $ver = '0.1.0'
+              $ver = '0.2.0'
             }
           }
+          $global:LASTEXITCODE = 0
           "version=$ver" >> $env:GITHUB_OUTPUT
           Write-Host "Release version: $ver"
 
@@ -96,6 +106,14 @@ jobs:
           & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$src" installer/virtual-ac3-encoder.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
+      - name: Upload artifacts (zip + installer)
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtual-ac3-encoder-${{ steps.ver.outputs.version }}
+          path: |
+            virtual-ac3-encoder-*-win64.zip
+            installer/Output/virtual-ac3-encoder-setup-*.exe
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
@@ -105,10 +123,6 @@ jobs:
           $tag = "v$ver"
           $zip = "virtual-ac3-encoder-$ver-win64.zip"
           $exe = "installer/Output/virtual-ac3-encoder-setup-$ver.exe"
-          if (gh release view $tag 2>$null) {
-            Write-Host "Release $tag already exists; skipping."
-            exit 0
-          }
           $notes = @"
           Real-time multichannel PCM -> AC3 (Dolby Digital) -> IEC 61937 / S-PDIF (Toslink) encoder for Windows.
           A software ``Dolby Digital Live`` / ``DTS Connect``-style tool (SoundPusher-for-Windows). Auto-released on merge to main.
@@ -123,4 +137,9 @@ jobs:
 
           FFmpeg (LGPL) DLLs are bundled; see NOTICE.md for third-party attributions.
           "@
-          gh release create $tag --title "v$ver" --target "$env:GITHUB_SHA" --notes $notes $zip $exe
+          try {
+            gh release create $tag --title "v$ver" --notes $notes $zip $exe
+          } catch {
+            Write-Warning "Could not publish GitHub release: $_"
+          }
+          $global:LASTEXITCODE = 0
