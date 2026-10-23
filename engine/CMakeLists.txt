@@ -95,10 +95,24 @@ target_include_directories(engine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated
 stage_ffmpeg_dlls(engine)
 
 # ---------------------------------------------------------------------------
-# Native Windows GUI for live engine control
+# Native Windows GUI for live engine control (Dear ImGui + DirectX 11)
 # ---------------------------------------------------------------------------
-add_executable(control_center WIN32 src/ControlCenter.cpp)
-target_link_libraries(control_center PRIVATE comctl32 ole32 propsys)
+set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/imgui")
+add_executable(control_center WIN32
+  src/ControlCenter.cpp
+  "${IMGUI_DIR}/imgui.cpp"
+  "${IMGUI_DIR}/imgui_draw.cpp"
+  "${IMGUI_DIR}/imgui_tables.cpp"
+  "${IMGUI_DIR}/imgui_widgets.cpp"
+  "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
+  "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
+)
+target_include_directories(control_center PRIVATE
+  src
+  "${IMGUI_DIR}"
+  "${IMGUI_DIR}/backends"
+)
+target_link_libraries(control_center PRIVATE comctl32 ole32 propsys d3d11 dxgi dwmapi)
 if(MSVC)
   target_compile_options(control_center PRIVATE /W4 /permissive- /utf-8)
 endif()

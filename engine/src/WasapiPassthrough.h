@@ -9,6 +9,7 @@
 #pragma once
 
 #include "ComUtil.h"
+#include "MeterSharedState.h"
 #include "RingBuffer.h"
 #include "SpdifEncoder.h"
 #include "WasapiCapture.h" // CaptureFormat
@@ -85,4 +86,5 @@ private:
   std::vector<uint8_t> staging_; // one packet of capture frames
   std::vector<uint8_t> silence_; // same, zeroed
   std::vector<uint8_t> burst_;   // one IEC 61937 burst
+  MeterSharedMemory    sharedMem_;
 };

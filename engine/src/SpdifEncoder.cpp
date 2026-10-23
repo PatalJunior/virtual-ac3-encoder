@@ -28,6 +28,20 @@ SpdifEncoder::SpdifEncoder()
 {
   for (auto& gain : channelGainLinear_)
     gain.store(1.0f, std::memory_order_relaxed);
+  for (size_t i = 0; i < 6; ++i)
+  {
+    peakLevels_[i].store(0.0f, std::memory_order_relaxed);
+    rmsLevels_[i].store(0.0f, std::memory_order_relaxed);
+  }
+}
+
+void SpdifEncoder::GetChannelLevels(float outPeaks[6], float outRms[6]) const
+{
+  for (size_t i = 0; i < 6; ++i)
+  {
+    outPeaks[i] = peakLevels_[i].load(std::memory_order_relaxed);
+    outRms[i] = rmsLevels_[i].load(std::memory_order_relaxed);
+  }
 }
 
 void SpdifEncoder::SetChannelGainsDb(const std::array<float, 6>& gainsDb)
@@ -58,6 +72,29 @@ void SpdifEncoder::ApplyChannelGains()
     else
       for (int i = 0; i < frame_->nb_samples; ++i)
         samples[i] *= gain;
+  }
+}
+
+void SpdifEncoder::ComputeLevels()
+{
+  if (!frame_ || !frame_->extended_data || !codecCtx_)
+    return;
+  const int channels = std::min(6, codecCtx_->ch_layout.nb_channels);
+  for (int ch = 0; ch < channels; ++ch)
+  {
+    const float* s = reinterpret_cast<const float*>(frame_->extended_data[ch]);
+    if (!s) continue;
+    float peak = 0.0f;
+    double sumSq = 0.0;
+    for (int i = 0; i < frame_->nb_samples; ++i)
+    {
+      const float a = std::fabs(s[i]);
+      if (a > peak) peak = a;
+      sumSq += static_cast<double>(a) * a;
+    }
+    const float rms = frame_->nb_samples > 0 ? static_cast<float>(std::sqrt(sumSq / frame_->nb_samples)) : 0.0f;
+    peakLevels_[static_cast<size_t>(ch)].store(peak, std::memory_order_relaxed);
+    rmsLevels_[static_cast<size_t>(ch)].store(rms, std::memory_order_relaxed);
   }
 }
 
@@ -405,6 +442,7 @@ int SpdifEncoder::EncodePacket(const uint8_t* in, uint8_t* outBuf, int outSize)
 
   // Per-channel trim applied to the 5.1 planar-float frame
   ApplyChannelGains();
+  ComputeLevels();
 
   frame_->pts = nextPts_;
   nextPts_ += framesPerPacket_;

@@ -1,34 +1,40 @@
-﻿#define WIN32_LEAN_AND_MEAN
+// ControlCenter.cpp — Modern Dark UI with Dear ImGui (DirectX 11) for Virtual AC3/DTS Encoder.
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <TlHelp32.h>
-#include <commctrl.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <dwmapi.h>
+#include <shellapi.h>
 #include <mmdeviceapi.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
-#include <cwctype>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <filesystem>
+
+#include "imgui.h"
+#include "backends/imgui_impl_win32.h"
+#include "backends/imgui_impl_dx11.h"
+#include "MeterSharedState.h"
+
+// Forward declare message handler from imgui_impl_win32.cpp
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace {
-constexpr int ID_INPUT = 1001;
-constexpr int ID_OUTPUT = 1002;
-constexpr int ID_MODE = 1003;
-constexpr int ID_APPLY = 1004;
-constexpr int ID_START = 1005;
-constexpr int ID_STOP = 1006;
-constexpr int ID_RESET = 1007;
-constexpr int ID_SLIDER_BASE = 1100;
-constexpr int ID_VALUE_BASE = 1200;
-constexpr UINT_PTR TIMER_ID = 1;
+
+constexpr UINT WM_TRAYICON = WM_USER + 101;
+constexpr UINT ID_TRAY_RESTORE = 2001;
+constexpr UINT ID_TRAY_TOGGLE = 2002;
+constexpr UINT ID_TRAY_EXIT = 2003;
 
 struct AudioDevice {
     std::wstring name;
@@ -36,32 +42,53 @@ struct AudioDevice {
 };
 using Kv = std::map<std::string, std::string>;
 
-HWND g_window = nullptr;
-HWND g_inputCombo = nullptr;
-HWND g_outputCombo = nullptr;
-HWND g_modeCombo = nullptr;
-HWND g_status = nullptr;
-HWND g_startButton = nullptr;
-HWND g_stopButton = nullptr;
-std::array<HWND, 6> g_sliders{};
-std::array<HWND, 6> g_values{};
-std::array<int, 6> g_gainDb{{0, 0, 0, 0, 0, 0}};
-std::vector<AudioDevice> g_captureDevices;
-std::vector<AudioDevice> g_renderDevices;
-bool g_inputListUsesRender = false;
+// DirectX 11 global state
+ID3D11Device*           g_pd3dDevice = nullptr;
+ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
+IDXGISwapChain*         g_pSwapChain = nullptr;
+ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+HWND                    g_hWnd = nullptr;
+NOTIFYICONDATAW         g_notifyIconData{};
+bool                    g_trayBalloonShown = false;
+
+// Process & File paths
 PROCESS_INFORMATION g_engine{};
 std::wstring g_exeDir;
 std::wstring g_configPath;
 std::wstring g_controlPath;
 std::wstring g_logPath;
-bool g_initializing = false;
 
-const std::array<const wchar_t*, 6> kChannelNames{{
-    L"Front Left (FL)", L"Front Right (FR)", L"Center (C)",
-    L"Subwoofer / LFE", L"Surround Left (SL)", L"Surround Right (SR)"
+// Audio devices & settings state
+std::vector<AudioDevice> g_captureDevices;
+std::vector<AudioDevice> g_renderDevices;
+int g_selectedInDevice = 0;
+int g_selectedOutDevice = 0;
+
+// Settings
+int g_outputMode = 0; // 0=DTS 5.1, 1=AC3 5.1, 2=PCM Stereo
+int g_dtsBitrate = 0; // 0=Full 1536k, 1=Half 768k
+int g_ac3Bitrate = 0; // 0=640k, 1=448k
+int g_latencyPreset = 2; // 0=Extreme, 1=Fast, 2=Balanced, 3=Safe, 4=Relaxed
+int g_upmixMode = 0; // 0=Dynamic Surround (Auto), 1=Always Surround, 2=Off
+bool g_loopback = false;
+bool g_configDirty = false;
+
+std::array<int, 6> g_gainDb{{0, 0, 0, 0, 0, 0}};
+std::array<bool, 6> g_channelMute{{false, false, false, false, false, false}};
+
+// Telemetry & meters
+MeterSharedMemory g_meterMem;
+std::array<float, 6> g_smoothedPeaks{{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
+std::array<float, 6> g_peakHold{{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
+std::array<int, 6> g_peakHoldFrames{{0, 0, 0, 0, 0, 0}};
+
+const std::array<const char*, 6> kChannelNames{{"FL", "FR", "C", "LFE", "SL", "SR"}};
+const std::array<const char*, 6> kChannelFullNames{{
+    "Front Left", "Front Right", "Center (Dialog)", "Subwoofer / LFE", "Surround Left", "Surround Right"
 }};
 const std::array<const char*, 6> kGainKeys{{"fl_db", "fr_db", "c_db", "lfe_db", "sl_db", "sr_db"}};
 
+// String helpers
 std::wstring ExeDirectory() {
     std::wstring path(32768, L'\0');
     DWORD n = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
@@ -81,33 +108,34 @@ std::string ToUtf8(const std::wstring& value) {
     return out;
 }
 
-std::wstring TrimW(std::wstring s) {
-    const auto first = s.find_first_not_of(L" \t\r\n");
-    if (first == std::wstring::npos) return L"";
-    const auto last = s.find_last_not_of(L" \t\r\n");
-    return s.substr(first, last - first + 1);
+std::wstring ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+    if (n <= 1) return {};
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, out.data(), n);
+    out.resize(static_cast<size_t>(n - 1));
+    return out;
 }
 
-std::string TrimA(std::string s) {
+std::string Trim(std::string s) {
     const auto first = s.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return "";
     const auto last = s.find_last_not_of(" \t\r\n");
     return s.substr(first, last - first + 1);
 }
 
+// Config file I/O
 Kv ReadKv(const std::wstring& path) {
     Kv values;
     std::ifstream in{std::filesystem::path(path), std::ios::binary};
     std::string line;
     while (std::getline(in, line)) {
-        if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
-            static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
-            line.erase(0, 3);
-        line = TrimA(line);
+        line = Trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        values[TrimA(line.substr(0, eq))] = TrimA(line.substr(eq + 1));
+        values[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
     }
     return values;
 }
@@ -116,7 +144,6 @@ bool WriteTextAtomic(const std::wstring& path, const std::string& content) {
     const std::wstring temp = path + L".tmp";
     {
         std::ofstream out{std::filesystem::path(temp), std::ios::binary | std::ios::trunc};
-        if (!out) return false;
         out.write(content.data(), static_cast<std::streamsize>(content.size()));
         out.flush();
         if (!out) return false;
@@ -134,6 +161,17 @@ bool WriteKvAtomic(const std::wstring& path, const Kv& values) {
     return WriteTextAtomic(path, out.str());
 }
 
+bool WriteControlFile(bool stop) {
+    std::ostringstream out;
+    out << "stop=" << (stop ? 1 : 0) << "\r\n";
+    for (size_t i = 0; i < g_gainDb.size(); ++i) {
+        int val = g_channelMute[i] ? -60 : g_gainDb[i];
+        out << kGainKeys[i] << '=' << val << "\r\n";
+    }
+    return WriteTextAtomic(g_controlPath, out.str());
+}
+
+// Device enumeration
 std::vector<AudioDevice> EnumerateDevices(EDataFlow flow) {
     std::vector<AudioDevice> result;
     IMMDeviceEnumerator* enumerator = nullptr;
@@ -171,76 +209,29 @@ std::vector<AudioDevice> EnumerateDevices(EDataFlow flow) {
     return result;
 }
 
-int FindById(const std::vector<AudioDevice>& devices, const std::string& id) {
+void RefreshDevices() {
+    g_captureDevices = EnumerateDevices(eCapture);
+    g_renderDevices = EnumerateDevices(eRender);
+}
+
+int FindDeviceById(const std::vector<AudioDevice>& devices, const std::string& id) {
     if (id.empty()) return -1;
     for (size_t i = 0; i < devices.size(); ++i)
         if (ToUtf8(devices[i].id) == id) return static_cast<int>(i);
     return -1;
 }
 
-int FindBySubstring(const std::vector<AudioDevice>& devices, const std::string& text) {
-    if (text.empty()) return -1;
-    for (size_t i = 0; i < devices.size(); ++i) {
-        const std::string name = ToUtf8(devices[i].name);
-        if (name.find(text) != std::string::npos) return static_cast<int>(i);
-    }
+int FindDeviceBySubstring(const std::vector<AudioDevice>& devices, const std::string& sub) {
+    for (size_t i = 0; i < devices.size(); ++i)
+        if (ToUtf8(devices[i].name).find(sub) != std::string::npos) return static_cast<int>(i);
     return -1;
 }
 
-int PreferredOutput() {
-    for (size_t i = 0; i < g_renderDevices.size(); ++i) {
-        std::wstring name = g_renderDevices[i].name;
-        std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-        if (name.find(L"realtek digital") != std::wstring::npos ||
-            name.find(L"digital output") != std::wstring::npos ||
-            name.find(L"spdif") != std::wstring::npos ||
-            name.find(L"s/pdif") != std::wstring::npos)
-            return static_cast<int>(i);
-    }
-    return g_renderDevices.empty() ? -1 : 0;
-}
-
-void PopulateDeviceCombo(HWND combo, const std::vector<AudioDevice>& devices) {
-    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
-    for (const auto& device : devices) SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(device.name.c_str()));
-}
-
-bool IsLoopbackMode(int mode) {
-    return mode == 4 || mode == 5;
-}
-
-void UpdateInputDeviceComboForMode(int mode, const std::string& configuredId, bool preserveCurrentSelection) {
-    if (!g_inputCombo) return;
-
-    const bool useRender = IsLoopbackMode(mode);
-    std::string selectedId = configuredId;
-
-    // При переключении DTS <-> Dolby сохраняем выбранный источник.
-    if (preserveCurrentSelection && g_inputListUsesRender == useRender) {
-        const LRESULT oldSel = SendMessageW(g_inputCombo, CB_GETCURSEL, 0, 0);
-        const auto& oldDevices = g_inputListUsesRender ? g_renderDevices : g_captureDevices;
-
-        if (oldSel >= 0 && static_cast<size_t>(oldSel) < oldDevices.size())
-            selectedId = ToUtf8(oldDevices[static_cast<size_t>(oldSel)].id);
-    }
-
-    const auto& devices = useRender ? g_renderDevices : g_captureDevices;
-    PopulateDeviceCombo(g_inputCombo, devices);
-
-    int index = FindById(devices, selectedId);
-    if (index < 0)
-        index = FindBySubstring(devices, useRender ? "CABLE Input" : "CABLE Output");
-    if (index < 0 && !devices.empty())
-        index = 0;
-
-    if (index >= 0)
-        SendMessageW(g_inputCombo, CB_SETCURSEL, index, 0);
-
-    g_inputListUsesRender = useRender;
-}
-
-void SetStatus(const std::wstring& text) {
-    if (g_status) SetWindowTextW(g_status, text.c_str());
+// Engine process management
+void CloseProcessHandles() {
+    if (g_engine.hThread) CloseHandle(g_engine.hThread);
+    if (g_engine.hProcess) CloseHandle(g_engine.hProcess);
+    ZeroMemory(&g_engine, sizeof(g_engine));
 }
 
 bool EngineRunning() {
@@ -250,528 +241,768 @@ bool EngineRunning() {
     return code == STILL_ACTIVE;
 }
 
-bool WriteControlFile(bool stop) {
-    std::ostringstream out;
-    out << "stop=" << (stop ? 1 : 0) << "\r\n";
-    for (size_t i = 0; i < g_gainDb.size(); ++i)
-        out << kGainKeys[i] << '=' << g_gainDb[i] << "\r\n";
-    return WriteTextAtomic(g_controlPath, out.str());
+void StopEngine() {
+    if (!g_engine.hProcess) {
+        WriteControlFile(false);
+        return;
+    }
+    if (EngineRunning()) {
+        WriteControlFile(true); // Signal graceful stop
+        DWORD wait = WaitForSingleObject(g_engine.hProcess, 2000);
+        if (wait == WAIT_TIMEOUT) {
+            TerminateProcess(g_engine.hProcess, 3);
+            WaitForSingleObject(g_engine.hProcess, 1000);
+        }
+    }
+    CloseProcessHandles();
+    WriteControlFile(false);
 }
 
-void UpdateGainLabel(size_t i) {
-    if (!g_values[i]) return;
-    std::wstring label;
-    if (g_gainDb[i] <= -60) label = L"MUTE";
-    else label = std::to_wstring(g_gainDb[i]) + L" dB";
-    SetWindowTextW(g_values[i], label.c_str());
+bool StartEngine() {
+    StopEngine();
+
+    const std::wstring enginePath = g_exeDir + L"\\engine.exe";
+    const DWORD attrs = GetFileAttributesW(enginePath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return false;
+    }
+
+    std::wstring command = L"\"" + enginePath + L"\" --hidden --log \"" + g_logPath + L"\"";
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+
+    if (!CreateProcessW(enginePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, g_exeDir.c_str(), &si, &pi)) {
+        return false;
+    }
+
+    g_engine = pi;
+    CloseHandle(g_engine.hThread);
+    g_engine.hThread = nullptr;
+    return true;
 }
 
-void ReadGainState() {
+void SaveConfiguration() {
+    Kv cfg = ReadKv(g_configPath);
+
+    const auto& inDevs = g_loopback ? g_renderDevices : g_captureDevices;
+    if (g_selectedInDevice >= 0 && static_cast<size_t>(g_selectedInDevice) < inDevs.size())
+        cfg["in_id"] = ToUtf8(inDevs[static_cast<size_t>(g_selectedInDevice)].id);
+
+    if (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
+        cfg["out_id"] = ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].id);
+
+    cfg.erase("in");
+    cfg.erase("out");
+    cfg.erase("out_spdif");
+    cfg["loopback"] = g_loopback ? "1" : "0";
+
+    if (g_outputMode == 0) {
+        cfg["output_mode"] = "dts";
+        cfg["dts_rate"] = (g_dtsBitrate == 0) ? "full" : "half";
+    } else if (g_outputMode == 1) {
+        cfg["output_mode"] = "ac3";
+        cfg["bitrate"] = (g_ac3Bitrate == 0) ? "640000" : "448000";
+    } else {
+        cfg["output_mode"] = "pcm";
+    }
+
+    const char* latencies[] = {"extreme", "fast", "balanced", "safe", "relaxed"};
+    cfg["latency"] = latencies[std::clamp(g_latencyPreset, 0, 4)];
+    cfg.erase("safe"); // Use preset
+
+    const char* upmixes[] = {"surround", "surround", "off"};
+    cfg["upmix"] = upmixes[std::clamp(g_upmixMode, 0, 2)];
+
+    WriteKvAtomic(g_configPath, cfg);
+    WriteControlFile(false);
+    g_configDirty = false;
+}
+
+void LoadConfiguration() {
+    Kv cfg = ReadKv(g_configPath);
+
+    g_loopback = (cfg["loopback"] == "1");
+
+    RefreshDevices();
+
+    const auto& inDevs = g_loopback ? g_renderDevices : g_captureDevices;
+    g_selectedInDevice = FindDeviceById(inDevs, cfg["in_id"]);
+    if (g_selectedInDevice < 0)
+        g_selectedInDevice = FindDeviceBySubstring(inDevs, g_loopback ? "CABLE Input" : "CABLE Output");
+    if (g_selectedInDevice < 0 && !inDevs.empty()) g_selectedInDevice = 0;
+
+    g_selectedOutDevice = FindDeviceById(g_renderDevices, cfg["out_id"]);
+    if (g_selectedOutDevice < 0)
+        g_selectedOutDevice = FindDeviceBySubstring(g_renderDevices, "Realtek Digital");
+    if (g_selectedOutDevice < 0 && !g_renderDevices.empty()) g_selectedOutDevice = 0;
+
+    const std::string mode = cfg["output_mode"];
+    if (mode == "dts") g_outputMode = 0;
+    else if (mode == "pcm") g_outputMode = 2;
+    else g_outputMode = 1; // ac3 default
+
+    const std::string dtsR = cfg["dts_rate"];
+    g_dtsBitrate = (dtsR == "half" || dtsR == "768000" || dtsR == "768k") ? 1 : 0;
+
+    const std::string ac3R = cfg["bitrate"];
+    g_ac3Bitrate = (ac3R == "448000" || ac3R == "448k" || ac3R == "448") ? 1 : 0;
+
+    const std::string lat = cfg["latency"];
+    if (lat == "extreme" || lat == "ultra") g_latencyPreset = 0;
+    else if (lat == "fast" || lat == "low") g_latencyPreset = 1;
+    else if (lat == "safe") g_latencyPreset = 3;
+    else if (lat == "relaxed" || lat == "normal") g_latencyPreset = 4;
+    else g_latencyPreset = 2; // balanced
+
+    const std::string up = cfg["upmix"];
+    if (up == "off") g_upmixMode = 2;
+    else g_upmixMode = 0; // dynamic surround
+
+    // Read control gains
     std::ifstream in{std::filesystem::path(g_controlPath)};
     std::string line;
     while (std::getline(in, line)) {
-        line = TrimA(line);
+        line = Trim(line);
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        const std::string key = TrimA(line.substr(0, eq));
-        const std::string value = TrimA(line.substr(eq + 1));
+        const std::string key = Trim(line.substr(0, eq));
+        const std::string val = Trim(line.substr(eq + 1));
         for (size_t i = 0; i < kGainKeys.size(); ++i) {
             if (key == kGainKeys[i]) {
                 try {
-                    int db = std::stoi(value);
-                    g_gainDb[i] = std::clamp(db, -60, 0);
+                    int db = std::stoi(val);
+                    if (db <= -60) {
+                        g_channelMute[i] = true;
+                        g_gainDb[i] = 0;
+                    } else {
+                        g_channelMute[i] = false;
+                        g_gainDb[i] = std::clamp(db, -60, 0);
+                    }
                 } catch (...) {}
             }
         }
     }
 }
 
-bool SaveSelectedConfiguration() {
-    const LRESULT modeResult = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
+// System tray helpers
+void InitTrayIcon(HWND hwnd) {
+    g_notifyIconData.cbSize = sizeof(NOTIFYICONDATAW);
+    g_notifyIconData.hWnd = hwnd;
+    g_notifyIconData.uID = 1;
+    g_notifyIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_notifyIconData.uCallbackMessage = WM_TRAYICON;
+    g_notifyIconData.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wcscpy_s(g_notifyIconData.szTip, L"Virtual AC3/DTS Encoder");
+    Shell_NotifyIconW(NIM_ADD, &g_notifyIconData);
+}
 
-    if (modeResult < 0 || modeResult > 5) {
-        MessageBoxW(g_window, L"Выбери режим кодирования.", L"AC3 Control Center", MB_ICONWARNING);
-        return false;
-    }
+void RemoveTrayIcon() {
+    Shell_NotifyIconW(NIM_DELETE, &g_notifyIconData);
+}
 
-    const int modeSel = static_cast<int>(modeResult);
-    const bool loopback = IsLoopbackMode(modeSel);
-    const auto& inputDevices = loopback ? g_renderDevices : g_captureDevices;
+void ShowTrayContextMenu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU hMenu = CreatePopupMenu();
+    InsertMenuW(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_TRAY_RESTORE, L"Open Control Center");
+    const bool isRunning = EngineRunning();
+    InsertMenuW(hMenu, 1, MF_BYPOSITION | MF_STRING, ID_TRAY_TOGGLE,
+                isRunning ? L"Disable (Release S/PDIF)" : L"Enable Encoding");
+    InsertMenuW(hMenu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    InsertMenuW(hMenu, 3, MF_BYPOSITION | MF_STRING, ID_TRAY_EXIT, L"Exit");
 
-    const LRESULT inSel = SendMessageW(g_inputCombo, CB_GETCURSEL, 0, 0);
-    const LRESULT outSel = SendMessageW(g_outputCombo, CB_GETCURSEL, 0, 0);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hMenu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(hMenu);
+}
 
-    if (inSel < 0 || static_cast<size_t>(inSel) >= inputDevices.size()) {
-        MessageBoxW(g_window, L"Выбери входное устройство для выбранного режима.", L"AC3 Control Center", MB_ICONWARNING);
-        return false;
-    }
+// DirectX 11 helpers
+bool CreateDeviceD3D(HWND hWnd) {
+    DXGI_SWAP_CHAIN_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    if (outSel < 0 || static_cast<size_t>(outSel) >= g_renderDevices.size()) {
-        MessageBoxW(g_window, L"Выбери цифровое устройство вывода, подключённое к ресиверу.", L"AC3 Control Center", MB_ICONWARNING);
-        return false;
-    }
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                                createDeviceFlags, featureLevelArray, 2,
+                                                D3D11_SDK_VERSION, &sd, &g_pSwapChain,
+                                                &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (res == DXGI_ERROR_UNSUPPORTED)
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                                            createDeviceFlags, featureLevelArray, 2,
+                                            D3D11_SDK_VERSION, &sd, &g_pSwapChain,
+                                            &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    if (res != S_OK) return false;
 
-    Kv cfg = ReadKv(g_configPath);
-    if (cfg.empty()) {
-        cfg["bitrate"] = "640000";
-        cfg["safe"] = "1536";
-    }
-
-    cfg["in_id"] = ToUtf8(inputDevices[static_cast<size_t>(inSel)].id);
-    cfg["out_id"] = ToUtf8(g_renderDevices[static_cast<size_t>(outSel)].id);
-    cfg.erase("in");
-    cfg.erase("out");
-    cfg.erase("out_spdif");
-    cfg["loopback"] = loopback ? "1" : "0";
-
-    if (modeSel == 2) {
-        cfg["output_mode"] = "pcm";
-        cfg["upmix"] = "off";
-    } else if (modeSel == 3) {
-        // Существующий DTS-режим с обычным захватом.
-        cfg["output_mode"] = "dts";
-        cfg["upmix"] = "surround";
-    } else if (modeSel == 4) {
-        // Новый многоканальный DTS Core: Loopback, без стереоапмикса.
-        cfg["output_mode"] = "dts";
-        cfg["upmix"] = "off";
-    } else if (modeSel == 5) {
-        // Новый многоканальный Dolby Digital: Loopback, без стереоапмикса.
-        cfg["output_mode"] = "ac3";
-        cfg["upmix"] = "off";
-    } else {
-        cfg["output_mode"] = "ac3";
-        cfg["upmix"] = modeSel == 0 ? "off" : "surround";
-    }
-
-    if (!WriteKvAtomic(g_configPath, cfg)) {
-        MessageBoxW(g_window, L"Не удалось записать virtual-ac3-encoder.conf. Проверь права доступа к папке.", L"AC3 Control Center", MB_ICONERROR);
-        return false;
-    }
-
-    if (!WriteControlFile(false)) {
-        MessageBoxW(g_window, L"Не удалось записать ac3-control.ini.", L"AC3 Control Center", MB_ICONERROR);
-        return false;
-    }
-
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
     return true;
 }
 
-void CloseProcessHandles() {
-    if (g_engine.hThread) CloseHandle(g_engine.hThread);
-    if (g_engine.hProcess) CloseHandle(g_engine.hProcess);
-    ZeroMemory(&g_engine, sizeof(g_engine));
+void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
 }
 
-bool FindAndAttachExistingEngine() {
-    const std::wstring expectedPath = g_exeDir + L"\\engine.exe";
-
-    std::wstring fullExpectedPath(32768, L'\0');
-    DWORD pathLength = GetFullPathNameW(
-        expectedPath.c_str(),
-        static_cast<DWORD>(fullExpectedPath.size()),
-        fullExpectedPath.data(),
-        nullptr
-    );
-
-    if (pathLength == 0 || pathLength >= fullExpectedPath.size())
-        return false;
-
-    fullExpectedPath.resize(pathLength);
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
-        return false;
-
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-
-    bool attached = false;
-
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (CompareStringOrdinal(
-                    entry.szExeFile, -1, L"engine.exe", -1, TRUE
-                ) != CSTR_EQUAL) {
-                continue;
-            }
-
-            HANDLE process = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION |
-                SYNCHRONIZE |
-                PROCESS_TERMINATE,
-                FALSE,
-                entry.th32ProcessID
-            );
-
-            if (!process)
-                continue;
-
-            std::wstring actualPath(32768, L'\0');
-            DWORD actualLength = static_cast<DWORD>(actualPath.size());
-
-            const BOOL queried = QueryFullProcessImageNameW(
-                process, 0, actualPath.data(), &actualLength
-            );
-
-            if (queried) {
-                actualPath.resize(actualLength);
-
-                if (CompareStringOrdinal(
-                        actualPath.c_str(), -1,
-                        fullExpectedPath.c_str(), -1, TRUE
-                    ) == CSTR_EQUAL &&
-                    WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
-
-                    g_engine.hProcess = process;
-                    g_engine.hThread = nullptr;
-                    g_engine.dwProcessId = entry.th32ProcessID;
-                    g_engine.dwThreadId = 0;
-                    attached = true;
-                    break;
-                }
-            }
-
-            CloseHandle(process);
-        } while (Process32NextW(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
-    return attached;
+void CleanupDeviceD3D() {
+    CleanupRenderTarget();
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
-bool StartEngine() {
-    if (EngineRunning()) {
-        SetStatus(L"Кодировщик уже работает.");
-        return true;
-    }
+// Dark Audio Style for Dear ImGui
+void SetupModernAudioStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
 
-    CloseProcessHandles();
+    style.WindowRounding    = 8.0f;
+    style.FrameRounding     = 5.0f;
+    style.PopupRounding     = 6.0f;
+    style.GrabRounding      = 4.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.TabRounding       = 5.0f;
+    style.WindowBorderSize  = 1.0f;
+    style.FrameBorderSize   = 1.0f;
+    style.ItemSpacing       = ImVec2(10.0f, 8.0f);
+    style.ItemInnerSpacing  = ImVec2(8.0f, 6.0f);
+    style.WindowPadding     = ImVec2(16.0f, 16.0f);
 
-    if (FindAndAttachExistingEngine()) {
-        SetStatus(L"Подключено к уже работающему кодировщику.");
-        return true;
-    }
-
-    if (!SaveSelectedConfiguration()) return false;
-    const std::wstring enginePath = g_exeDir + L"\\engine.exe";
-    const DWORD attrs = GetFileAttributesW(enginePath.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        MessageBoxW(g_window, L"Не найден engine.exe рядом с Control Center. Сначала собери проект CMake.", L"AC3 Control Center", MB_ICONERROR);
-        return false;
-    }
-    std::wstring command = L"\"" + enginePath + L"\" --hidden --log \"" + g_logPath + L"\"";
-    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
-    mutableCommand.push_back(L'\0');
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(enginePath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, g_exeDir.c_str(), &si, &pi)) {
-        const DWORD err = GetLastError();
-        std::wstring message = L"Не удалось запустить engine.exe. Код Windows: " + std::to_wstring(err);
-        MessageBoxW(g_window, message.c_str(), L"AC3 Control Center", MB_ICONERROR);
-        return false;
-    }
-    g_engine = pi;
-    CloseHandle(g_engine.hThread);
-    g_engine.hThread = nullptr;
-    SetStatus(L"Запуск кодировщика… подробности: engine.log");
-    return true;
+    // Deep slate and dark cyber-audio palette
+    colors[ImGuiCol_Text]                  = ImVec4(0.92f, 0.94f, 0.96f, 1.00f);
+    colors[ImGuiCol_TextDisabled]          = ImVec4(0.50f, 0.55f, 0.60f, 1.00f);
+    colors[ImGuiCol_WindowBg]              = ImVec4(0.09f, 0.10f, 0.12f, 1.00f); // #17191F
+    colors[ImGuiCol_ChildBg]               = ImVec4(0.12f, 0.13f, 0.16f, 1.00f);
+    colors[ImGuiCol_PopupBg]               = ImVec4(0.12f, 0.14f, 0.18f, 0.98f);
+    colors[ImGuiCol_Border]                = ImVec4(0.20f, 0.24f, 0.28f, 0.70f);
+    colors[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg]               = ImVec4(0.15f, 0.17f, 0.21f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered]        = ImVec4(0.20f, 0.24f, 0.30f, 1.00f);
+    colors[ImGuiCol_FrameBgActive]         = ImVec4(0.24f, 0.29f, 0.36f, 1.00f);
+    colors[ImGuiCol_TitleBg]               = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]         = ImVec4(0.12f, 0.14f, 0.18f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.09f, 0.10f, 0.12f, 0.75f);
+    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.12f, 0.14f, 0.18f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.09f, 0.10f, 0.12f, 0.50f);
+    colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.24f, 0.28f, 0.34f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.30f, 0.36f, 0.44f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.38f, 0.46f, 0.56f, 1.00f);
+    colors[ImGuiCol_CheckMark]             = ImVec4(0.15f, 0.85f, 0.65f, 1.00f); // Bright Mint
+    colors[ImGuiCol_SliderGrab]            = ImVec4(0.13f, 0.75f, 0.85f, 1.00f); // Vibrant Cyan
+    colors[ImGuiCol_SliderGrabActive]      = ImVec4(0.25f, 0.85f, 0.95f, 1.00f);
+    colors[ImGuiCol_Button]                = ImVec4(0.17f, 0.20f, 0.26f, 1.00f);
+    colors[ImGuiCol_ButtonHovered]         = ImVec4(0.23f, 0.28f, 0.36f, 1.00f);
+    colors[ImGuiCol_ButtonActive]          = ImVec4(0.28f, 0.35f, 0.45f, 1.00f);
+    colors[ImGuiCol_Header]                = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
+    colors[ImGuiCol_HeaderHovered]         = ImVec4(0.24f, 0.30f, 0.40f, 1.00f);
+    colors[ImGuiCol_HeaderActive]          = ImVec4(0.30f, 0.38f, 0.50f, 1.00f);
+    colors[ImGuiCol_Separator]             = ImVec4(0.20f, 0.24f, 0.28f, 0.70f);
+    colors[ImGuiCol_SeparatorHovered]      = ImVec4(0.30f, 0.36f, 0.44f, 1.00f);
+    colors[ImGuiCol_SeparatorActive]       = ImVec4(0.13f, 0.75f, 0.85f, 1.00f);
+    colors[ImGuiCol_Tab]                   = ImVec4(0.14f, 0.17f, 0.22f, 1.00f);
+    colors[ImGuiCol_TabHovered]            = ImVec4(0.22f, 0.28f, 0.36f, 1.00f);
+    colors[ImGuiCol_TabActive]             = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
+    colors[ImGuiCol_PlotLines]             = ImVec4(0.13f, 0.75f, 0.85f, 1.00f);
+    colors[ImGuiCol_PlotHistogram]         = ImVec4(0.15f, 0.85f, 0.65f, 1.00f);
 }
 
-void StopEngine(bool updateStatus = true) {
-    if (!g_engine.hProcess && !FindAndAttachExistingEngine()) {
-        WriteControlFile(false);
-        if (updateStatus) SetStatus(L"Работающий кодировщик не найден.");
-        return;
-    }
-    if (EngineRunning()) {
-        WriteControlFile(true);
-        DWORD wait = WaitForSingleObject(g_engine.hProcess, 3000);
-        if (wait == WAIT_TIMEOUT) {
-            TerminateProcess(g_engine.hProcess, 3);
-            WaitForSingleObject(g_engine.hProcess, 1500);
-            if (updateStatus) SetStatus(L"Движок не ответил на штатную остановку; процесс завершён принудительно.");
+// 6-channel VU meters renderer
+void DrawSpeakerVUMeters(bool isRunning) {
+    ImGui::TextColored(ImVec4(0.7f, 0.75f, 0.8f, 1.0f), "REAL-TIME 5.1 SPEAKER METERS");
+
+    const float meterWidth = 96.0f;
+    const float meterHeight = 130.0f;
+    const float barWidth = 24.0f;
+
+    // Read shared memory levels
+    std::array<float, 6> rawPeaks{{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
+    if (isRunning && g_meterMem.IsOpen()) {
+        const MeterSharedState* state = g_meterMem.Get();
+        if (state && state->active) {
+            for (size_t i = 0; i < 6; ++i)
+                rawPeaks[i] = state->peakLevels[i];
         }
     }
-    CloseProcessHandles();
-    WriteControlFile(false);
-    if (updateStatus) SetStatus(L"Кодировщик остановлен.");
-}
 
-void ApplyConfiguration() {
-    if (!SaveSelectedConfiguration()) return;
-    if (EngineRunning()) {
-        const int answer = MessageBoxW(g_window,
-            L"Изменение режима или устройств требует перезапуска кодировщика. Звук кратковременно прервётся. Перезапустить сейчас?",
-            L"Применить настройки", MB_YESNO | MB_ICONQUESTION);
-        if (answer != IDYES) {
-            SetStatus(L"Настройки сохранены; перезапуск не выполнен.");
-            return;
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 0.0f));
+    for (size_t i = 0; i < 6; ++i) {
+        if (i > 0) ImGui::SameLine();
+
+        ImGui::BeginGroup();
+
+        // Decay ballistics
+        const float peak = rawPeaks[i];
+        if (peak >= g_smoothedPeaks[i]) {
+            g_smoothedPeaks[i] = peak;
+        } else {
+            g_smoothedPeaks[i] = std::max(0.0f, g_smoothedPeaks[i] - 0.035f); // Smooth falloff
         }
-        StopEngine(false);
-        if (StartEngine()) SetStatus(L"Настройки применены, кодировщик перезапущен.");
-    } else {
-        SetStatus(L"Настройки сохранены. Нажми «Запустить» для применения.");
+
+        // Peak-hold indicator
+        if (peak >= g_peakHold[i]) {
+            g_peakHold[i] = peak;
+            g_peakHoldFrames[i] = 45; // Hold for 45 frames (~0.75s)
+        } else if (g_peakHoldFrames[i] > 0) {
+            g_peakHoldFrames[i]--;
+        } else {
+            g_peakHold[i] = std::max(0.0f, g_peakHold[i] - 0.02f);
+        }
+
+        const float linearVal = g_smoothedPeaks[i];
+        float db = (linearVal > 0.0001f) ? (20.0f * std::log10(linearVal)) : -60.0f;
+        db = std::clamp(db, -60.0f, 0.0f);
+        const float norm = (db + 60.0f) / 60.0f; // 0.0 to 1.0
+
+        // Channel header
+        ImGui::TextColored(ImVec4(0.13f, 0.75f, 0.85f, 1.0f), "%s", kChannelNames[i]);
+
+        // Draw meter background
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const ImVec2 bgMin = p;
+        const ImVec2 bgMax = ImVec2(p.x + barWidth, p.y + meterHeight);
+
+        drawList->AddRectFilled(bgMin, bgMax, IM_COL32(20, 24, 30, 255), 4.0f);
+        drawList->AddRect(bgMin, bgMax, IM_COL32(40, 48, 58, 255), 4.0f);
+
+        // Fill active level
+        if (norm > 0.01f) {
+            const float filledHeight = norm * meterHeight;
+            const ImVec2 fillMin = ImVec2(p.x + 2, bgMax.y - filledHeight);
+            const ImVec2 fillMax = ImVec2(bgMax.x - 2, bgMax.y - 2);
+
+            // Three-color gradient / segment styling
+            ImU32 colTop = IM_COL32(32, 226, 128, 255);    // Green
+            ImU32 colBottom = IM_COL32(20, 180, 100, 255);
+            if (db > -3.0f) {
+                colTop = IM_COL32(235, 60, 60, 255);       // Red clip
+            } else if (db > -12.0f) {
+                colTop = IM_COL32(245, 170, 35, 255);      // Yellow warm
+            }
+
+            drawList->AddRectFilledMultiColor(fillMin, fillMax, colTop, colTop, colBottom, colBottom);
+        }
+
+        // Draw peak-hold line
+        const float holdDb = (g_peakHold[i] > 0.0001f) ? (20.0f * std::log10(g_peakHold[i])) : -60.0f;
+        const float holdNorm = std::clamp((holdDb + 60.0f) / 60.0f, 0.0f, 1.0f);
+        if (holdNorm > 0.02f) {
+            const float holdY = bgMax.y - (holdNorm * meterHeight);
+            drawList->AddLine(ImVec2(p.x + 1, holdY), ImVec2(bgMax.x - 1, holdY),
+                              IM_COL32(255, 255, 255, 220), 1.5f);
+        }
+
+        ImGui::Dummy(ImVec2(barWidth, meterHeight));
+
+        // dB text label
+        if (g_channelMute[i]) {
+            ImGui::TextColored(ImVec4(0.8f, 0.3f, 0.3f, 1.0f), "MUTE");
+        } else if (db <= -59.5f) {
+            ImGui::TextDisabled("-inf");
+        } else {
+            ImGui::Text("%.1f", db);
+        }
+
+        ImGui::EndGroup();
     }
+    ImGui::PopStyleVar();
 }
 
-void UpdateModeControls() {
-    if (!g_modeCombo) return;
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
 
-    const LRESULT mode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
-    const bool pcmMode = mode == 2;
-
-    for (size_t i = 0; i < g_sliders.size(); ++i)
-        EnableWindow(g_sliders[i], !pcmMode || i < 2);
-
-    if (mode == 2) {
-        SetStatus(L"PCM Stereo 2.0: используются только левый и правый каналы.");
-    } else if (mode == 4) {
-        SetStatus(L"PCM 5.1 -> DTS 5.1 Core: Loopback, без апмикса.");
-    } else if (mode == 5) {
-        SetStatus(L"PCM 5.1 -> Dolby Digital 5.1: Loopback, без апмикса.");
-    }
-}
-
-void ResetGains() {
-    g_initializing = true;
-    for (size_t i = 0; i < g_sliders.size(); ++i) {
-        g_gainDb[i] = 0;
-        SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, 0);
-        UpdateGainLabel(i);
-    }
-    g_initializing = false;
-    WriteControlFile(false);
-    SetStatus(EngineRunning() ? L"Все уровни сброшены на 0 dB и применены." : L"Уровни сброшены на 0 dB.");
-}
-
-bool g_uiOnly = false;
-
-void CheckEngineStatus() {
-    if (!g_engine.hProcess) return;
-    DWORD code = 0;
-    if (GetExitCodeProcess(g_engine.hProcess, &code) && code != STILL_ACTIVE) {
-        CloseProcessHandles();
-        SetStatus(L"Движок остановлен (код завершения " + std::to_wstring(code) + L"). Подробности: engine.log");
-    }
-}
-
-HWND AddControl(const wchar_t* cls, const wchar_t* text, DWORD style,
-                int x, int y, int w, int h, int id, HWND parent) {
-    return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                           x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                           GetModuleHandleW(nullptr), nullptr);
-}
-
-void CreateControls(HWND hwnd) {
-    AddControl(L"STATIC", L"Входное устройство:", 0, 20, 18, 260, 24, 0, hwnd);
-    g_inputCombo = AddControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 290, 16, 560, 240, ID_INPUT, hwnd);
-    PopulateDeviceCombo(g_inputCombo, g_captureDevices);
-
-    AddControl(L"STATIC", L"Цифровой выход (S/PDIF / Toslink):", 0, 20, 55, 260, 24, 0, hwnd);
-    g_outputCombo = AddControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 290, 52, 560, 240, ID_OUTPUT, hwnd);
-    PopulateDeviceCombo(g_outputCombo, g_renderDevices);
-
-    AddControl(L"STATIC", L"Формат цифрового выхода:", 0, 20, 93, 230, 24, 0, hwnd);
-    g_modeCombo = AddControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, 290, 89, 270, 220, ID_MODE, hwnd);
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — без upmix"));
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dolby Digital 5.1 — Surround upmix"));
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM Stereo 2.0 — обычный S/PDIF"));
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DTS 5.1 Core - Toslink / S/PDIF"));
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM 5.1 -> DTS 5.1 Core"));
-    SendMessageW(g_modeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"PCM 5.1 -> Dolby Digital 5.1"));
-    AddControl(L"BUTTON", L"Применить / перезапустить", BS_PUSHBUTTON | WS_TABSTOP, 575, 88, 275, 30, ID_APPLY, hwnd);
-
-    AddControl(L"STATIC", L"Громкость каналов (−60 dB = MUTE; 0 dB = исходный уровень). Ползунки применяются на лету.", 0, 20, 130, 830, 24, 0, hwnd);
-    for (size_t i = 0; i < g_sliders.size(); ++i) {
-        const int y = 166 + static_cast<int>(i) * 45;
-        AddControl(L"STATIC", kChannelNames[i], 0, 20, y + 3, 255, 24, 0, hwnd);
-        g_sliders[i] = AddControl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                                  290, y, 460, 32, ID_SLIDER_BASE + static_cast<int>(i), hwnd);
-        SendMessageW(g_sliders[i], TBM_SETRANGE, TRUE, MAKELPARAM(-60, 0));
-        SendMessageW(g_sliders[i], TBM_SETTICFREQ, 10, 0);
-        SendMessageW(g_sliders[i], TBM_SETPOS, TRUE, g_gainDb[i]);
-        g_values[i] = AddControl(L"STATIC", L"0 dB", SS_RIGHT, 765, y + 5, 80, 22, ID_VALUE_BASE + static_cast<int>(i), hwnd);
-        UpdateGainLabel(i);
-    }
-    AddControl(L"BUTTON", L"Сбросить все уровни", BS_PUSHBUTTON | WS_TABSTOP, 290, 445, 190, 32, ID_RESET, hwnd);
-    g_startButton = AddControl(L"BUTTON", L"Запустить кодировщик", BS_PUSHBUTTON | WS_TABSTOP, 20, 495, 220, 36, ID_START, hwnd);
-    g_stopButton = AddControl(L"BUTTON", L"Остановить", BS_PUSHBUTTON | WS_TABSTOP, 255, 495, 180, 36, ID_STOP, hwnd);
-    g_status = AddControl(L"STATIC", L"Готов. Кодировщик остановлен.", 0, 20, 545, 830, 38, 0, hwnd);
-
-    Kv cfg = ReadKv(g_configPath);
-    int outIndex = FindById(g_renderDevices, cfg["out_id"]);
-    if (outIndex < 0) outIndex = FindBySubstring(g_renderDevices, cfg["out"]);
-    if (outIndex < 0) outIndex = PreferredOutput();
-    if (outIndex >= 0) SendMessageW(g_outputCombo, CB_SETCURSEL, outIndex, 0);
-    const LRESULT selectedMode = cfg["output_mode"] == "pcm" ? 2 :
-        cfg["output_mode"] == "dts" ? (cfg["loopback"] == "1" ? 4 : 3) :
-        cfg["loopback"] == "1" ? 5 :
-        (cfg["upmix"] == "off" ? 0 : 1);
-    SendMessageW(g_modeCombo, CB_SETCURSEL, selectedMode, 0);
-    UpdateInputDeviceComboForMode(static_cast<int>(selectedMode), cfg["in_id"], false);
-    UpdateModeControls();
-    EnableWindow(g_startButton, !g_captureDevices.empty() && !g_renderDevices.empty());
-    EnableWindow(g_stopButton, FALSE);
-    SetTimer(hwnd, TIMER_ID, 500, nullptr);
-}
-
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE:
-        CreateControls(hwnd);
+    switch (msg) {
+    case WM_TRAYICON:
+        if (lParam == WM_LBUTTONDBLCLK) {
+            ShowWindow(hWnd, SW_SHOW);
+            ShowWindow(hWnd, SW_RESTORE);
+            SetForegroundWindow(hWnd);
+        } else if (lParam == WM_RBUTTONUP) {
+            ShowTrayContextMenu(hWnd);
+        }
         return 0;
-    case WM_COMMAND: {
-        const int id = LOWORD(wParam);
 
-        if (g_uiOnly &&
-            (id == ID_START || id == ID_STOP ||
-             id == ID_APPLY || id == ID_RESET))
-            return 0;
-        if (id == ID_MODE && HIWORD(wParam) == CBN_SELCHANGE) {
-            const LRESULT mode = SendMessageW(g_modeCombo, CB_GETCURSEL, 0, 0);
-            Kv currentCfg = ReadKv(g_configPath);
-            UpdateInputDeviceComboForMode(static_cast<int>(mode), currentCfg["in_id"], true);
-            UpdateModeControls();
-            if (mode == 2)
-                SetStatus(L"Выбран PCM Stereo 2.0. Нажми «Применить / перезапустить» для переключения формата.");
-            else if (mode == 4)
-                SetStatus(L"PCM 5.1 -> DTS 5.1 Core: Loopback, без апмикса. Нажми «Применить / перезапустить».");
-            else if (mode == 5)
-                SetStatus(L"PCM 5.1 -> Dolby Digital 5.1: Loopback, без апмикса. Нажми «Применить / перезапустить».");
-            else if (mode == 3)
-                SetStatus(L"DTS 5.1 Core выбран. Нажми Применить / перезапустить для переключения формата.");
-            else
-                SetStatus(L"Выбран выход Dolby Digital 5.1. Нажми «Применить / перезапустить» для переключения формата.");
-            return 0;
-        }
-        if (id == ID_START && HIWORD(wParam) == BN_CLICKED) {
-            if (StartEngine()) {
-                EnableWindow(g_startButton, FALSE);
-                EnableWindow(g_stopButton, TRUE);
-            }
-            return 0;
-        }
-        if (id == ID_STOP && HIWORD(wParam) == BN_CLICKED) {
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_TRAY_RESTORE:
+            ShowWindow(hWnd, SW_SHOW);
+            ShowWindow(hWnd, SW_RESTORE);
+            SetForegroundWindow(hWnd);
+            break;
+        case ID_TRAY_TOGGLE:
+            if (EngineRunning()) StopEngine();
+            else StartEngine();
+            break;
+        case ID_TRAY_EXIT:
             StopEngine();
-            EnableWindow(g_startButton, TRUE);
-            EnableWindow(g_stopButton, FALSE);
-            return 0;
-        }
-        if (id == ID_APPLY && HIWORD(wParam) == BN_CLICKED) {
-            ApplyConfiguration();
-            const bool running = EngineRunning();
-            EnableWindow(g_startButton, !running);
-            EnableWindow(g_stopButton, running);
-            return 0;
-        }
-        if (id == ID_RESET && HIWORD(wParam) == BN_CLICKED) {
-            ResetGains();
-            return 0;
+            DestroyWindow(hWnd);
+            break;
         }
         return 0;
-    }
-    case WM_HSCROLL: {
-        if (g_uiOnly) return 0;
-        if (g_initializing) return 0;
-        HWND slider = reinterpret_cast<HWND>(lParam);
-        for (size_t i = 0; i < g_sliders.size(); ++i) {
-            if (slider == g_sliders[i]) {
-                g_gainDb[i] = static_cast<int>(SendMessageW(g_sliders[i], TBM_GETPOS, 0, 0));
-                UpdateGainLabel(i);
-                WriteControlFile(false);
-                SetStatus(EngineRunning() ? L"Уровни каналов применяются в реальном времени." : L"Уровни сохранены; будут использованы при запуске.");
-                break;
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_MINIMIZE) {
+            ShowWindow(hWnd, SW_HIDE);
+            if (!g_trayBalloonShown) {
+                g_notifyIconData.uFlags |= NIF_INFO;
+                wcscpy_s(g_notifyIconData.szInfoTitle, L"Virtual AC3/DTS Encoder");
+                wcscpy_s(g_notifyIconData.szInfo, L"Minimized to tray. Double-click icon to open.");
+                g_notifyIconData.dwInfoFlags = NIIF_INFO;
+                Shell_NotifyIconW(NIM_MODIFY, &g_notifyIconData);
+                g_trayBalloonShown = true;
             }
+            return 0;
         }
-        return 0;
-    }
-    case WM_TIMER:
-        CheckEngineStatus();
-        if (g_startButton && g_stopButton) {
-            const bool running = EngineRunning();
-            EnableWindow(g_startButton, !running);
-            EnableWindow(g_stopButton, running);
-        }
-        return 0;
+        break;
+
     case WM_CLOSE:
-        CloseProcessHandles();
-        DestroyWindow(hwnd);
+        ShowWindow(hWnd, SW_HIDE);
+        return 0; // Minimize to tray instead of quitting
+
+    case WM_SIZE:
+        if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            ID3D11Texture2D* pBackBuffer = nullptr;
+            g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+            g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+            pBackBuffer->Release();
+        }
         return 0;
+
     case WM_DESTROY:
-        KillTimer(hwnd, TIMER_ID);
+        RemoveTrayIcon();
         PostQuitMessage(0);
         return 0;
-    default:
-        return DefWindowProcW(hwnd, message, wParam, lParam);
     }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
+
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_BAR_CLASSES};
-    InitCommonControlsEx(&icc);
-    const HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    const bool uninitializeCom = SUCCEEDED(comHr);
-
-    g_uiOnly = std::wstring(GetCommandLineW()).find(L"--ui-only") != std::wstring::npos;
-
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     g_exeDir = ExeDirectory();
     g_configPath = g_exeDir + L"\\virtual-ac3-encoder.conf";
     g_controlPath = g_exeDir + L"\\ac3-control.ini";
     g_logPath = g_exeDir + L"\\engine.log";
-    g_captureDevices = EnumerateDevices(eCapture);
-    g_renderDevices = EnumerateDevices(eRender);
-    ReadGainState();
 
-    const wchar_t CLASS_NAME[] = L"Ac3ControlCenterWindow";
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WindowProc;
-    wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.lpszClassName = CLASS_NAME;
-    if (!RegisterClassExW(&wc)) {
-        if (uninitializeCom) CoUninitialize();
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    WNDCLASSEXW wc = {
+        sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, hInstance,
+        LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),
+        nullptr, nullptr, L"VirtualAc3DtsControlCenter", nullptr
+    };
+    RegisterClassExW(&wc);
+
+    const int winWidth = 740;
+    const int winHeight = 760;
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    const int posX = std::max(0, (screenW - winWidth) / 2);
+    const int posY = std::max(0, (screenH - winHeight) / 2);
+
+    g_hWnd = CreateWindowW(wc.lpszClassName, L"Virtual AC3 / DTS Control Center",
+                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                           posX, posY, winWidth, winHeight, nullptr, nullptr, wc.hInstance, nullptr);
+
+    if (!CreateDeviceD3D(g_hWnd)) {
+        CleanupDeviceD3D();
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
-    g_window = CreateWindowExW(0, CLASS_NAME, L"AC3 / DTS Control Center - Dolby Digital / DTS / PCM Stereo",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 640, nullptr, nullptr, instance, nullptr);
-    if (!g_window) {
-        if (uninitializeCom) CoUninitialize();
-        return 1;
-    }
-    ShowWindow(g_window, showCommand);
-    UpdateWindow(g_window);
-    if (g_uiOnly) {
-        EnableWindow(g_startButton, FALSE);
-        EnableWindow(g_stopButton, FALSE);
-        EnableWindow(GetDlgItem(g_window, ID_APPLY), FALSE);
-        EnableWindow(GetDlgItem(g_window, ID_RESET), FALSE);
-        EnableWindow(g_inputCombo, FALSE);
-        EnableWindow(g_outputCombo, FALSE);
 
-        for (HWND slider : g_sliders) {
-            EnableWindow(slider, FALSE);
+    InitTrayIcon(g_hWnd);
+    ShowWindow(g_hWnd, SW_SHOWDEFAULT);
+    UpdateWindow(g_hWnd);
+
+    // Initialize Dear ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr; // Don't create imgui.ini
+
+    SetupModernAudioStyle();
+    ImGui_ImplWin32_Init(g_hWnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Open telemetry shared memory
+    g_meterMem.OpenConsumer();
+
+    // Load initial settings
+    LoadConfiguration();
+
+    // Start engine automatically if not running
+    if (!EngineRunning()) {
+        StartEngine();
+    }
+
+    auto lastCheck = std::chrono::steady_clock::now();
+
+    // Main render loop
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+                done = true;
+        }
+        if (done) break;
+
+        // Periodic check (every 500 ms) for shared memory reconnection
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastCheck >= std::chrono::milliseconds(500)) {
+            lastCheck = now;
+            if (!g_meterMem.IsOpen()) g_meterMem.OpenConsumer();
         }
 
-        SetStatus(L"UI-only: просмотр режимов; движок и настройки не изменяются.");
-    } else if (StartEngine()) {
-        EnableWindow(g_startButton, FALSE);
-        EnableWindow(g_stopButton, TRUE);
+        const bool isRunning = EngineRunning();
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        // Single fullscreen ImGui window matching the client area
+        RECT rect;
+        GetClientRect(g_hWnd, &rect);
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(rect.right), static_cast<float>(rect.bottom)));
+        ImGui::Begin("MainControlPanel", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        // --- 1. Master Power Bar ---
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+        if (isRunning) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.65f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.75f, 0.45f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.10f, 0.55f, 0.35f, 1.0f));
+            if (ImGui::Button("[ ACTIVE: ENCODING TO S/PDIF ]  (Click to Disable & Release Port)", ImVec2(-1, 38))) {
+                StopEngine();
+            }
+            ImGui::PopStyleColor(3);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.32f, 0.38f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.40f, 0.48f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.22f, 0.25f, 0.30f, 1.0f));
+            if (ImGui::Button("[ DISABLED: S/PDIF RELEASED ]  (Click to Enable Encoding)", ImVec2(-1, 38))) {
+                SaveConfiguration();
+                StartEngine();
+            }
+            ImGui::PopStyleColor(3);
+        }
+        ImGui::PopStyleVar();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // --- 2. Real-Time VU Meters ---
+        DrawSpeakerVUMeters(isRunning);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // --- 3. Audio Routing & Hardware Configuration ---
+        if (ImGui::CollapsingHeader("AUDIO ROUTING & FORMAT", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto& inDevs = g_loopback ? g_renderDevices : g_captureDevices;
+
+            // Input Device
+            std::string inCurrentName = (g_selectedInDevice >= 0 && static_cast<size_t>(g_selectedInDevice) < inDevs.size())
+                ? ToUtf8(inDevs[static_cast<size_t>(g_selectedInDevice)].name) : "Select Input...";
+            if (ImGui::BeginCombo("Input Device", inCurrentName.c_str())) {
+                for (int i = 0; i < static_cast<int>(inDevs.size()); ++i) {
+                    const bool isSel = (g_selectedInDevice == i);
+                    if (ImGui::Selectable(ToUtf8(inDevs[static_cast<size_t>(i)].name).c_str(), isSel)) {
+                        g_selectedInDevice = i;
+                        g_configDirty = true;
+                    }
+                    if (isSel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            // Output S/PDIF Device
+            std::string outCurrentName = (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
+                ? ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].name) : "Select Output...";
+            if (ImGui::BeginCombo("Digital Output (S/PDIF)", outCurrentName.c_str())) {
+                for (int i = 0; i < static_cast<int>(g_renderDevices.size()); ++i) {
+                    const bool isSel = (g_selectedOutDevice == i);
+                    if (ImGui::Selectable(ToUtf8(g_renderDevices[static_cast<size_t>(i)].name).c_str(), isSel)) {
+                        g_selectedOutDevice = i;
+                        g_configDirty = true;
+                    }
+                    if (isSel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Refresh Devices")) {
+                RefreshDevices();
+            }
+
+            // Output Format
+            const char* modes[] = { "DTS 5.1 Surround", "Dolby Digital 5.1 (AC3)", "PCM Stereo 2.0 (Pass-through)" };
+            if (ImGui::Combo("Encoder Mode", &g_outputMode, modes, IM_ARRAYSIZE(modes))) {
+                g_configDirty = true;
+            }
+
+            // Bitrates
+            if (g_outputMode == 0) { // DTS
+                const char* dtsRates[] = { "1536 kbps (Full-Rate Core - Samsung HT-DB750 Recommended)", "768 kbps (Half-Rate Core - Standard DVD)" };
+                if (ImGui::Combo("DTS Bitrate", &g_dtsBitrate, dtsRates, IM_ARRAYSIZE(dtsRates))) {
+                    g_configDirty = true;
+                }
+            } else if (g_outputMode == 1) { // AC3
+                const char* ac3Rates[] = { "640 kbps (Maximum Optical Quality)", "448 kbps (Standard DVD Rate)" };
+                if (ImGui::Combo("AC3 Bitrate", &g_ac3Bitrate, ac3Rates, IM_ARRAYSIZE(ac3Rates))) {
+                    g_configDirty = true;
+                }
+            }
+
+            // Latency Presets
+            const char* latencies[] = {
+                "Extreme (~3 ms / 128 smp) - High-End PC Only",
+                "Fast (~7 ms / 256 smp) - Competitive Gaming",
+                "Balanced (~12 ms / 512 smp) - Recommended",
+                "Safe (~20 ms / 768 smp) - High Stability",
+                "Relaxed (~35 ms / 1536 smp) - Conservative / Laptop"
+            };
+            if (ImGui::Combo("Latency Preset", &g_latencyPreset, latencies, IM_ARRAYSIZE(latencies))) {
+                g_configDirty = true;
+            }
+
+            // Stereo Upmixing
+            const char* upmixes[] = {
+                "Dynamic Surround (Auto: Upmix Stereo to 5.1, Pass 5.1 Discrete Untouched)",
+                "Always Surround (Force 5.1 Upmix)",
+                "Off (Plain Multichannel Passthrough / Front Stereo Only)"
+            };
+            if (ImGui::Combo("Stereo Upmix", &g_upmixMode, upmixes, IM_ARRAYSIZE(upmixes))) {
+                g_configDirty = true;
+            }
+
+            // Apply Button if settings changed
+            if (g_configDirty) {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.15f, 1.0f));
+                if (ImGui::Button("APPLY SETTINGS & RESTART ENCODER", ImVec2(-1, 32))) {
+                    SaveConfiguration();
+                    if (isRunning) StartEngine();
+                }
+                ImGui::PopStyleColor();
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // --- 4. Channel Gain Sliders ---
+        if (ImGui::CollapsingHeader("SPEAKER LEVEL TRIMS (-60 dB to 0 dB)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            bool gainsChanged = false;
+
+            for (size_t i = 0; i < 6; ++i) {
+                ImGui::PushID(static_cast<int>(i));
+
+                // Mute button
+                if (g_channelMute[i]) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+                    if (ImGui::Button("Muted", ImVec2(55, 0))) {
+                        g_channelMute[i] = false;
+                        gainsChanged = true;
+                    }
+                    ImGui::PopStyleColor();
+                } else {
+                    if (ImGui::Button("Mute", ImVec2(55, 0))) {
+                        g_channelMute[i] = true;
+                        gainsChanged = true;
+                    }
+                }
+
+                ImGui::SameLine();
+                char sliderLabel[64];
+                snprintf(sliderLabel, sizeof(sliderLabel), "%s (%s)", kChannelNames[i], kChannelFullNames[i]);
+
+                if (g_channelMute[i]) {
+                    int dummy = -60;
+                    ImGui::BeginDisabled();
+                    ImGui::SliderInt(sliderLabel, &dummy, -60, 0, "MUTED");
+                    ImGui::EndDisabled();
+                } else {
+                    if (ImGui::SliderInt(sliderLabel, &g_gainDb[i], -60, 0, "%d dB")) {
+                        gainsChanged = true;
+                    }
+                }
+
+                ImGui::PopID();
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Button("Reset All Trims to 0 dB")) {
+                for (size_t i = 0; i < 6; ++i) {
+                    g_gainDb[i] = 0;
+                    g_channelMute[i] = false;
+                }
+                gainsChanged = true;
+            }
+
+            if (gainsChanged) {
+                WriteControlFile(false);
+            }
+        }
+
+        ImGui::End();
+
+        // Rendering
+        ImGui::Render();
+        const float clear_color[4] = { 0.09f, 0.10f, 0.12f, 1.00f };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        g_pSwapChain->Present(1, 0); // VSync 60 FPS
     }
-    MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-    if (uninitializeCom) CoUninitialize();
-    return static_cast<int>(msg.wParam);
+
+    // Cleanup
+    g_meterMem.Close();
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupDeviceD3D();
+    DestroyWindow(g_hWnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    CoUninitialize();
+
+    return 0;
 }

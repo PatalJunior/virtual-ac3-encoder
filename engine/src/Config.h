@@ -24,6 +24,26 @@ struct Config
 
   int64_t  bitRate = 640000;
   uint32_t safeFrames = 1536;
+  bool     customSafeFrames = false;
+  std::string latencyMode = "balanced"; // "extreme", "fast", "balanced", "safe", "relaxed"
+
+  uint32_t GetEffectiveSafeFrames() const
+  {
+    if (customSafeFrames && safeFrames > 0)
+      return safeFrames;
+
+    const bool dts = (outputMode == "dts");
+    if (latencyMode == "extreme" || latencyMode == "ultra")
+      return dts ? 128 : 256;
+    if (latencyMode == "fast" || latencyMode == "low")
+      return dts ? 256 : 512;
+    if (latencyMode == "balanced")
+      return dts ? 512 : 768;
+    if (latencyMode == "safe")
+      return dts ? 768 : 1024;
+    // "relaxed", "normal", or default
+    return 1536;
+  }
 
   // Stereo->5.1 upmix mode for <=2ch input: "off" (swr default) or "surround"
   // (FFmpeg `surround` FFT upmix). Multichannel input is always downmixed to 5.1.

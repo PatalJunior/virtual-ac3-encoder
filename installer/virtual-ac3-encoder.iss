@@ -26,6 +26,7 @@ UninstallDisplayName=Virtual AC3 Encoder {#AppVersion}
 
 [Files]
 Source: "{#SourceDir}\engine.exe";        DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\control_center.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceDir}\*.dll";             DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\supervisor.vbs";    DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\stop-engine.ps1";   DestDir: "{app}"; Flags: ignoreversion
@@ -41,6 +42,7 @@ Source: "{#SourceDir}\virtual-ac3-encoder.conf"; DestDir: "{app}"; Flags: onlyif
 ; Autostart hidden at logon via the self-locating supervisor:
 Name: "{userstartup}\Virtual AC3 Encoder"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\supervisor.vbs"""; WorkingDir: "{app}"
 ; Start Menu:
+Name: "{group}\Control Center";        Filename: "{app}\control_center.exe"; WorkingDir: "{app}"
 Name: "{group}\Edit config";        Filename: "{win}\notepad.exe"; Parameters: """{app}\virtual-ac3-encoder.conf"""
 Name: "{group}\View log";           Filename: "{win}\notepad.exe"; Parameters: """{app}\engine.log"""
 Name: "{group}\List audio devices"; Filename: "{cmd}"; Parameters: "/k """"{app}\engine.exe"""" --list"

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "ComUtil.h"
+#include "MeterSharedState.h"
 #include "RingBuffer.h"
 #include "WasapiCapture.h"
 
@@ -58,6 +59,7 @@ private:
   HANDLE stopEvent_ = nullptr;
   std::thread thread_;
   std::atomic_bool running_{false};
+  MeterSharedMemory sharedMem_;
   std::array<std::atomic<float>, 2> gainsLinear_;
   std::vector<uint8_t> inputStaging_;
   uint32_t cycle_ = 0;

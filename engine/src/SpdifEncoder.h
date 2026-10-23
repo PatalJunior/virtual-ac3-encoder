@@ -68,6 +68,9 @@ public:
   void Close();
   bool IsOpen() const { return codecCtx_ != nullptr; }
 
+  // Thread-safe access to latest output frame peak and RMS levels (0.0 .. 1.0)
+  void GetChannelLevels(float outPeaks[6], float outRms[6]) const;
+
   // Input sample-frames consumed per EncodePacket() call (AC3 == 1536, DTS == 512).
   int FramesPerPacket() const { return framesPerPacket_; }
   // Channels expected in the interleaved input (== inLayout.nb_channels).
@@ -92,10 +95,14 @@ private:
   bool FeedFilter(const uint8_t* in);  // push one input packet, drain output into fifo_
   int  EncodeFrameToBurst(uint8_t* outBuf, int outSize);
   void ApplyChannelGains();
+  void ComputeLevels();
 
   // Dynamic upmix helpers: detect stereo content in a multichannel stream and extract FL+FR.
   bool IsEffectivelyStereo(const uint8_t* in) const;
   void ExtractStereo(const uint8_t* in, uint8_t* out) const;
+
+  mutable std::array<std::atomic<float>, 6> peakLevels_{};
+  mutable std::array<std::atomic<float>, 6> rmsLevels_{};
 
   AVCodecContext*  codecCtx_ = nullptr;
   AVFormatContext* muxer_    = nullptr;

@@ -1,6 +1,7 @@
 // test_encoder.cpp — contract tests for SpdifEncoder (PCM -> AC3 -> IEC 61937).
 #include "doctest.h"
 #include "SpdifEncoder.h"
+#include "Config.h"
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -185,6 +186,76 @@ TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (half rate 768k)")
   REQUIRE(n > 0);
   CHECK(n == 2048);
   CHECK(HasIec61937Sync(out.data()));
+}
+
+TEST_CASE("latency: Config::GetEffectiveSafeFrames scales correctly")
+{
+  Config c;
+  c.outputMode = "dts";
+  c.latencyMode = "extreme";
+  CHECK(c.GetEffectiveSafeFrames() == 128);
+
+  c.latencyMode = "fast";
+  CHECK(c.GetEffectiveSafeFrames() == 256);
+
+  c.latencyMode = "balanced";
+  CHECK(c.GetEffectiveSafeFrames() == 512);
+
+  c.latencyMode = "safe";
+  CHECK(c.GetEffectiveSafeFrames() == 768);
+
+  c.latencyMode = "relaxed";
+  CHECK(c.GetEffectiveSafeFrames() == 1536);
+
+  // AC3 mode
+  c.outputMode = "ac3";
+  c.latencyMode = "extreme";
+  CHECK(c.GetEffectiveSafeFrames() == 256);
+
+  c.latencyMode = "fast";
+  CHECK(c.GetEffectiveSafeFrames() == 512);
+
+  c.latencyMode = "balanced";
+  CHECK(c.GetEffectiveSafeFrames() == 768);
+
+  c.latencyMode = "safe";
+  CHECK(c.GetEffectiveSafeFrames() == 1024);
+
+  c.latencyMode = "relaxed";
+  CHECK(c.GetEffectiveSafeFrames() == 1536);
+
+  // Custom numeric override
+  c.safeFrames = 333;
+  c.customSafeFrames = true;
+  CHECK(c.GetEffectiveSafeFrames() == 333);
+}
+
+TEST_CASE("telemetry: SpdifEncoder calculates channel peak and RMS levels")
+{
+  SpdifEncoder enc;
+  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::AC3));
+  const int fpp = enc.FramesPerPacket();
+  std::vector<float> in(static_cast<size_t>(fpp) * 6, 0.0f);
+  for (int i = 0; i < fpp; ++i)
+  {
+    in[static_cast<size_t>(i) * 6 + 0] = 0.5f;  // FL
+    in[static_cast<size_t>(i) * 6 + 1] = -0.25f; // FR
+  }
+
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+  int n = enc.EncodePacket(reinterpret_cast<const uint8_t*>(in.data()), out.data(),
+                           static_cast<int>(out.size()));
+  REQUIRE(n > 0);
+
+  float peaks[6] = {0};
+  float rms[6] = {0};
+  enc.GetChannelLevels(peaks, rms);
+  CHECK(peaks[0] == doctest::Approx(0.5f).epsilon(0.01f));
+  CHECK(peaks[1] == doctest::Approx(0.25f).epsilon(0.01f));
+  CHECK(rms[0] == doctest::Approx(0.5f).epsilon(0.01f));
+  CHECK(rms[1] == doctest::Approx(0.25f).epsilon(0.01f));
+  CHECK(peaks[2] == doctest::Approx(0.0f).epsilon(0.001f));
+  CHECK(peaks[3] == doctest::Approx(0.0f).epsilon(0.001f));
 }
 
 // (The surround upmix is covered by a meaningful behavioral test in test_upmix.cpp:

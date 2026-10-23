@@ -172,6 +172,7 @@ bool WasapiPassthrough::Init(IMMDevice* dev, RingBuffer* ring, const CaptureForm
   staging_.resize(pktBytes);
   silence_.assign(pktBytes, 0);
   burst_.resize(kMaxBurstBytes);
+  sharedMem_.OpenProducer();
   return true;
 }
 
@@ -330,9 +331,32 @@ bool WasapiPassthrough::Start()
   {
     EncodeIntoBuffer(out);
     render_->ReleaseBuffer(bufferFrames_, 0);
+
+    if (sharedMem_.IsOpen())
+    {
+      MeterSharedState* ms = sharedMem_.Get();
+      if (ms)
+      {
+        enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        ms->active = 1;
+        ms->frameCounter++;
+      }
+    }
   }
 
   HR_FAIL(client_->Start(), "client Start");
+  if (sharedMem_.IsOpen())
+  {
+    MeterSharedState* ms = sharedMem_.Get();
+    if (ms)
+    {
+      ms->active = 1;
+      ms->sampleRate = static_cast<uint32_t>(capFmt_.sampleRate);
+      ms->channels = 6;
+      ms->isDts = (params_.codec == SpdifEncoder::Codec::DTS ? 1 : 0);
+      ms->safeFrames = params_.safeFrames;
+    }
+  }
   thread_ = std::thread(&WasapiPassthrough::ThreadProc, this);
   return true;
 }
@@ -341,6 +365,15 @@ void WasapiPassthrough::Stop()
 {
   if (!running_.exchange(false))
     return;
+  if (sharedMem_.IsOpen())
+  {
+    MeterSharedState* ms = sharedMem_.Get();
+    if (ms)
+    {
+      ms->active = 0;
+      for (int i = 0; i < 6; ++i) { ms->peakLevels[i] = 0.0f; ms->rmsLevels[i] = 0.0f; }
+    }
+  }
   if (stopEvent_) SetEvent(stopEvent_);
   if (thread_.joinable()) thread_.join();
   if (client_) client_->Stop();
@@ -390,6 +423,17 @@ void WasapiPassthrough::ThreadProc()
     }
     EncodeIntoBuffer(out);
     render_->ReleaseBuffer(bufferFrames_, 0);
+
+    if (sharedMem_.IsOpen())
+    {
+      MeterSharedState* ms = sharedMem_.Get();
+      if (ms)
+      {
+        enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        ms->active = 1;
+        ms->frameCounter++;
+      }
+    }
   }
 
   if (mmcss) AvRevertMmThreadCharacteristics(mmcss);

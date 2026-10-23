@@ -162,6 +162,7 @@ bool WasapiPcmOutput::Init(IMMDevice* dev, RingBuffer* ring, const CaptureFormat
 
   std::printf("[WasapiPcmOutput] initialized normal PCM output: 2 ch, %u Hz, %u-bit %s (shared mode, not IEC 61937)\n",
               outRate_, outBits_, outSampleFmt_ == AV_SAMPLE_FMT_FLT ? "float" : "integer");
+  sharedMem_.OpenProducer();
   return true;
 }
 
@@ -186,6 +187,18 @@ bool WasapiPcmOutput::Start()
     std::fprintf(stderr, "[WasapiPcmOutput] client Start failed: %s\n", HrStr(hr).c_str());
     return false;
   }
+  if (sharedMem_.IsOpen())
+  {
+    MeterSharedState* ms = sharedMem_.Get();
+    if (ms)
+    {
+      ms->active = 1;
+      ms->sampleRate = outRate_;
+      ms->channels = 2;
+      ms->isDts = 2;
+      ms->safeFrames = safeFrames_;
+    }
+  }
   thread_ = std::thread(&WasapiPcmOutput::ThreadProc, this);
   return true;
 }
@@ -193,6 +206,15 @@ bool WasapiPcmOutput::Start()
 void WasapiPcmOutput::Stop()
 {
   running_.store(false, std::memory_order_relaxed);
+  if (sharedMem_.IsOpen())
+  {
+    MeterSharedState* ms = sharedMem_.Get();
+    if (ms)
+    {
+      ms->active = 0;
+      for (int i = 0; i < 6; ++i) { ms->peakLevels[i] = 0.0f; ms->rmsLevels[i] = 0.0f; }
+    }
+  }
   if (stopEvent_) SetEvent(stopEvent_);
   if (thread_.joinable()) thread_.join();
   if (client_) client_->Stop();
@@ -284,6 +306,42 @@ void WasapiPcmOutput::ThreadProc()
         std::memset(output + static_cast<size_t>(produced) * outBytesPerFrame_, 0,
                     static_cast<size_t>(writableFrames - static_cast<UINT32>(produced)) * outBytesPerFrame_);
       ApplyStereoGains(output, static_cast<uint32_t>(produced));
+      if (sharedMem_.IsOpen())
+      {
+        MeterSharedState* ms = sharedMem_.Get();
+        if (ms && produced > 0)
+        {
+          float pL = 0.0f, pR = 0.0f;
+          double sqL = 0.0, sqR = 0.0;
+          if (outSampleFmt_ == AV_SAMPLE_FMT_FLT)
+          {
+            const float* f = reinterpret_cast<const float*>(output);
+            for (int i = 0; i < produced; ++i)
+            {
+              float l = std::fabs(f[2 * i]), r = std::fabs(f[2 * i + 1]);
+              if (l > pL) pL = l; if (r > pR) pR = r;
+              sqL += l * l; sqR += r * r;
+            }
+          }
+          else if (outSampleFmt_ == AV_SAMPLE_FMT_S16)
+          {
+            const int16_t* s = reinterpret_cast<const int16_t*>(output);
+            for (int i = 0; i < produced; ++i)
+            {
+              float l = std::fabs(s[2 * i] / 32768.0f), r = std::fabs(s[2 * i + 1] / 32768.0f);
+              if (l > pL) pL = l; if (r > pR) pR = r;
+              sqL += l * l; sqR += r * r;
+            }
+          }
+          ms->peakLevels[0] = pL;
+          ms->peakLevels[1] = pR;
+          ms->rmsLevels[0] = static_cast<float>(std::sqrt(sqL / produced));
+          ms->rmsLevels[1] = static_cast<float>(std::sqrt(sqR / produced));
+          for (int c = 2; c < 6; ++c) { ms->peakLevels[c] = 0.0f; ms->rmsLevels[c] = 0.0f; }
+          ms->active = 1;
+          ms->frameCounter++;
+        }
+      }
     }
 
     hr = render_->ReleaseBuffer(writableFrames, 0);

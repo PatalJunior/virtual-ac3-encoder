@@ -80,8 +80,15 @@ static void LoadConfigFile(const std::string& path, Config& c)
     else if (k == "in_id")     c.inId = Widen(v.c_str());
     else if (k == "out")       c.outName = Widen(v.c_str());
     else if (k == "out_id")    c.outId = Widen(v.c_str());
-    else if (k == "bitrate")   c.bitRate = std::strtoll(v.c_str(), nullptr, 10);
-    else if (k == "safe")      c.safeFrames = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+    else if (k == "bitrate")
+    {
+      if (v == "640k" || v == "640") c.bitRate = 640000;
+      else if (v == "448k" || v == "448") c.bitRate = 448000;
+      else if (v == "384k" || v == "384") c.bitRate = 384000;
+      else c.bitRate = std::strtoll(v.c_str(), nullptr, 10);
+    }
+    else if (k == "safe")      { c.safeFrames = (uint32_t)std::strtoul(v.c_str(), nullptr, 10); c.customSafeFrames = true; }
+    else if (k == "latency" || k == "latency_mode") c.latencyMode = v;
     else if (k == "loopback")  c.loopback = truthy(v);
     else if (k == "out_spdif") c.outAutoSpdif = truthy(v);
     else if (k == "upmix")     c.upmix = v;
@@ -158,8 +165,16 @@ static void ParseArgs(int argc, char** argv, Config& c)
     else if (a == "--out")        c.outName = next();
     else if (a == "--out-id")     c.outId = next();
     else if (a == "--out-spdif")  c.outAutoSpdif = true;
-    else if (a == "--bitrate" && i + 1 < argc) c.bitRate = std::strtoll(argv[++i], nullptr, 10);
-    else if (a == "--safe" && i + 1 < argc)    c.safeFrames = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
+    else if (a == "--bitrate" && i + 1 < argc)
+    {
+      std::string v = argv[++i];
+      if (v == "640k" || v == "640") c.bitRate = 640000;
+      else if (v == "448k" || v == "448") c.bitRate = 448000;
+      else if (v == "384k" || v == "384") c.bitRate = 384000;
+      else c.bitRate = std::strtoll(v.c_str(), nullptr, 10);
+    }
+    else if (a == "--safe" && i + 1 < argc)    { c.safeFrames = (uint32_t)std::strtoul(argv[++i], nullptr, 10); c.customSafeFrames = true; }
+    else if (a == "--latency" && i + 1 < argc) c.latencyMode = argv[++i];
     else if (a == "--upmix" && i + 1 < argc)   c.upmix = argv[++i];
     else if (a == "--output-mode" && i + 1 < argc) c.outputMode = argv[++i];
     else if (a == "--dts-rate" && i + 1 < argc)
@@ -345,11 +360,15 @@ int main(int argc, char** argv)
 
   const bool pcmMode = (cfg.outputMode == "pcm");
   const bool dtsMode = (cfg.outputMode == "dts");
+  const uint32_t effectiveSafe = cfg.GetEffectiveSafeFrames();
+  std::printf("Latency : %s (safeFrames = %u, ~%.1f ms)\n", cfg.latencyMode.c_str(),
+              effectiveSafe, 1000.0 * effectiveSafe / cf.sampleRate);
+
   WasapiPassthrough ac3Out;
   WasapiPcmOutput pcmOut;
   if (pcmMode)
   {
-    if (!pcmOut.Init(outDev.Get(), &ring, cf, cfg.safeFrames)) return 1;
+    if (!pcmOut.Init(outDev.Get(), &ring, cf, effectiveSafe)) return 1;
     if (!pcmOut.Start()) { std::fprintf(stderr, "PCM output start failed\n"); return 1; }
   }
   else
@@ -358,7 +377,7 @@ int main(int argc, char** argv)
     pp.codec = dtsMode ? SpdifEncoder::Codec::DTS : SpdifEncoder::Codec::AC3;
     pp.bitRate = cfg.bitRate;
     pp.dtsBitRate = cfg.dtsBitRate;
-    pp.safeFrames = cfg.safeFrames;
+    pp.safeFrames = effectiveSafe;
     pp.upmixSurround = (cfg.upmix == "surround");
     if (!ac3Out.Init(outDev.Get(), &ring, cf, pp)) return 1;
     if (!ac3Out.Start()) { std::fprintf(stderr, "AC3 passthrough start failed\n"); return 1; }
