@@ -22,10 +22,23 @@ bool HasIec61937Sync(const uint8_t* b)
   return le || be;
 }
 
+// DTS frame syncword: 0x7FFE8001 (16-bit core) in BE/LE, or 14-bit core in BE/LE.
+// When DTS is encoded at full rate (1536 kbps), the 2048-byte DTS payload completely fills
+// the S/PDIF slot, so the IEC 61937 preamble is omitted by FFmpeg and the burst begins
+// directly with the DTS syncword.
+bool HasDtsSync(const uint8_t* b)
+{
+  const bool be16 = (b[0] == 0x7F && b[1] == 0xFE && b[2] == 0x80 && b[3] == 0x01);
+  const bool le16 = (b[0] == 0xFE && b[1] == 0x7F && b[2] == 0x01 && b[3] == 0x80);
+  const bool be14 = (b[0] == 0x1F && b[1] == 0xFE && b[2] == 0x80 && b[3] == 0x00);
+  const bool le14 = (b[0] == 0xFF && b[1] == 0x1F && b[2] == 0x00 && b[3] == 0xE8);
+  return be16 || le16 || be14 || le14;
+}
+
 // Helper: init an encoder for `channels` interleaved samples in `fmt`.
 bool InitFor(SpdifEncoder& enc, int channels, AVSampleFormat fmt, int rate = 48000,
              SpdifEncoder::Codec codec = SpdifEncoder::Codec::AC3,
-             int64_t dtsBitRate = 1536000)
+             int64_t dtsBitRate = 768000)
 {
   SpdifEncoder::Params p;
   p.codec = codec;
@@ -132,10 +145,10 @@ TEST_CASE("init: DTS 5.1 encoder (full rate 1536k and half rate 768k)")
   CHECK(encHalf.InChannels() == 6);
 }
 
-TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (full rate)")
+TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst")
 {
   SpdifEncoder enc;
-  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 1536000));
+  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS));
   std::vector<float> in(static_cast<size_t>(enc.FramesPerPacket()) * 6, 0.1f);
   std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
 
@@ -146,7 +159,21 @@ TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (full rate)")
   CHECK(HasIec61937Sync(out.data()));
 }
 
-TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (half rate)")
+TEST_CASE("DTS 5.1 -> 2048-byte burst (full rate 1536k)")
+{
+  SpdifEncoder enc;
+  REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 1536000));
+  std::vector<float> in(static_cast<size_t>(enc.FramesPerPacket()) * 6, 0.1f);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+
+  int n = enc.EncodePacket(reinterpret_cast<const uint8_t*>(in.data()), out.data(),
+                           static_cast<int>(out.size()));
+  REQUIRE(n > 0);
+  CHECK(n == 2048);
+  CHECK((HasIec61937Sync(out.data()) || HasDtsSync(out.data())));
+}
+
+TEST_CASE("DTS 5.1 -> 2048-byte IEC 61937 burst (half rate 768k)")
 {
   SpdifEncoder enc;
   REQUIRE(InitFor(enc, 6, AV_SAMPLE_FMT_FLT, 48000, SpdifEncoder::Codec::DTS, 768000));
