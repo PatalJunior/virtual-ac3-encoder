@@ -350,7 +350,9 @@ int main(int argc, char** argv)
   std::printf("Output  : %s %s\n", Narrow(outInfo.name.c_str()).c_str(), outInfo.isSpdif ? "[SPDIF]" : "");
 
   WasapiCapture capture;
-  if (!capture.Init(inDev.Get(), cfg.loopback)) return 1;
+  const REFERENCE_TIME capBufferHns =
+      (cfg.latencyMode == "relaxed" || cfg.latencyMode == "safe") ? 200000 : 100000;
+  if (!capture.Init(inDev.Get(), cfg.loopback, capBufferHns)) return 1;
 
   const CaptureFormat& cf = capture.Format();
   // Ring sized to ~8 AC3 packets of capture audio (drift absorber).

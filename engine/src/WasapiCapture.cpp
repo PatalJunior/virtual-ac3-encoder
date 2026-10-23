@@ -14,9 +14,10 @@ WasapiCapture::~WasapiCapture()
   if (stopEvent_) CloseHandle(stopEvent_);
 }
 
-bool WasapiCapture::Init(IMMDevice* dev, bool loopback)
+bool WasapiCapture::Init(IMMDevice* dev, bool loopback, REFERENCE_TIME bufferHns)
 {
   loopback_ = loopback;
+  bufferHns_ = (bufferHns > 0) ? bufferHns : 100000;
   HR_FAIL(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client_), "Activate IAudioClient");
 
   WAVEFORMATEX* mix = nullptr;
@@ -36,8 +37,7 @@ bool WasapiCapture::Init(IMMDevice* dev, bool loopback)
   // Shared mode. Loopback streams cannot be event-driven, so they are polled instead.
   // periodicity must be 0 in shared mode.
   const DWORD flags = loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK : AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-  REFERENCE_TIME bufferHns = 200000; // 20 ms; WASAPI may enlarge as needed
-  HRESULT hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, bufferHns, 0, mix, nullptr);
+  HRESULT hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, bufferHns_, 0, mix, nullptr);
   CoTaskMemFree(mix);
   if (FAILED(hr)) { std::fprintf(stderr, "[WasapiCapture] Initialize failed: %s\n", HrStr(hr).c_str()); return false; }
 
@@ -117,9 +117,10 @@ void WasapiCapture::ThreadProc()
   if (loopback_)
   {
     // Loopback streams aren't event-driven: poll, waking early if asked to stop.
+    const DWORD pollMs = (bufferHns_ <= 100000) ? 2 : 5;
     while (running_.load(std::memory_order_relaxed))
     {
-      if (WaitForSingleObject(stopEvent_, 5) == WAIT_OBJECT_0) // ~5 ms poll
+      if (WaitForSingleObject(stopEvent_, pollMs) == WAIT_OBJECT_0)
         break;
       drain();
     }

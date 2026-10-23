@@ -2,6 +2,7 @@
 #include "doctest.h"
 #include "SpdifEncoder.h"
 #include "Config.h"
+#include "MeterSharedState.h"
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -256,6 +257,31 @@ TEST_CASE("telemetry: SpdifEncoder calculates channel peak and RMS levels")
   CHECK(rms[1] == doctest::Approx(0.25f).epsilon(0.01f));
   CHECK(peaks[2] == doctest::Approx(0.0f).epsilon(0.001f));
   CHECK(peaks[3] == doctest::Approx(0.0f).epsilon(0.001f));
+}
+
+TEST_CASE("telemetry: MeterSharedMemory IPC producer and consumer transfer data")
+{
+  MeterSharedMemory producer;
+  REQUIRE(producer.OpenProducer());
+  MeterSharedState* pState = producer.Get();
+  REQUIRE(pState != nullptr);
+  pState->active = 1;
+  pState->peakLevels[0] = 0.85f;
+  pState->peakLevels[1] = 0.72f;
+  pState->frameCounter = 12345;
+
+  MeterSharedMemory consumer;
+  REQUIRE(consumer.OpenConsumer());
+  const MeterSharedState* cState = consumer.Get();
+  REQUIRE(cState != nullptr);
+  CHECK(cState->magic == kMeterMagic);
+  CHECK(cState->active == 1);
+  CHECK(cState->peakLevels[0] == doctest::Approx(0.85f));
+  CHECK(cState->peakLevels[1] == doctest::Approx(0.72f));
+  CHECK(cState->frameCounter == 12345);
+
+  consumer.Close();
+  producer.Close();
 }
 
 // (The surround upmix is covered by a meaningful behavioral test in test_upmix.cpp:

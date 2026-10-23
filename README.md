@@ -14,8 +14,9 @@ output to an AV receiver.
 > "Dolby Digital Live" / "DTS Interactive" / "DTS Connect" isn't available on your motherboard or
 > USB sound card (Realtek, ASUS Xonar, etc.).
 >
-> _Currently encodes **AC3 (Dolby Digital, 5.1, 640 kbps)**. DTS Connect-style **DTS** output is a
-> feasible extension — FFmpeg ships a DTS encoder; see the design notes in `CLAUDE.md`._
+> _Supports **DTS 5.1 (1536 kbps / 768 kbps)**, **Dolby Digital AC3 5.1 (640 kbps / 448 kbps)**,
+> **PCM Stereo 2.0 pass-through**, **Dynamic 5.1 Stereo Upmixing**, **5-tier low latency presets**,
+> and a modern **DirectX 11 Dear ImGui Control Center** with live 6-speaker VU meters._
 
 **Keywords:** Dolby Digital Live, DTS Connect, DTS Interactive, software AC3 encoder, real-time
 AC3/AC-3 encoder, 5.1 surround over optical/SPDIF/Toslink, IEC 61937 passthrough, WASAPI exclusive
@@ -66,7 +67,10 @@ the same engine Kodi uses internally. See `third_party/reference/` for the clone
 - [x] **Working end-to-end (confirmed).** Because Secure Boot is ON here, the live system uses
       **VB-CABLE** as the 5.1 source: `engine --in "CABLE Output" --out "Realtek Digital Output"`
       → receiver decodes **Dolby Digital**. (Our own driver is ready for when Secure Boot is off.)
-- [ ] **Phase 4 — packaging** (config file + auto-start at logon; optional tray UI).
+- [x] **Phase 4 — modern UI & packaging.** Modern DirectX 11 Dear ImGui Control Center
+      with real-time 6-speaker animated VU meters, master Enable/Disable toggle (releasing optical
+      port), system tray minimization, 5-tier latency presets (Extreme to Relaxed), and DTS 5.1
+      (1536k & 768k) support. Inno Setup installer + portable release pipeline.
 
 ## Components / engine flags
 

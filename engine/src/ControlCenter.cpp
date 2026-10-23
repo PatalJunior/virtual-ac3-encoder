@@ -704,7 +704,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
     g_exeDir = ExeDirectory();
     g_configPath = g_exeDir + L"\\virtual-ac3-encoder.conf";
     g_controlPath = g_exeDir + L"\\ac3-control.ini";
@@ -737,8 +737,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     }
 
     InitTrayIcon(g_hWnd);
-    ShowWindow(g_hWnd, SW_SHOWDEFAULT);
-    UpdateWindow(g_hWnd);
+    const bool startMinimized = (pCmdLine && (wcsstr(pCmdLine, L"--minimized") || wcsstr(pCmdLine, L"--tray")));
+    if (!startMinimized) {
+        ShowWindow(g_hWnd, SW_SHOWDEFAULT);
+        UpdateWindow(g_hWnd);
+    }
 
     // Initialize Dear ImGui
     IMGUI_CHECKVERSION();
