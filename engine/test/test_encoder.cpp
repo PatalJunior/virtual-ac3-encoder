@@ -199,16 +199,16 @@ TEST_CASE("latency: Config::GetEffectiveSafeFrames scales correctly")
   CHECK(c.GetEffectiveSafeFrames() == 512);
 
   c.latencyMode = "fast";
-  CHECK(c.GetEffectiveSafeFrames() == 512);
-
-  c.latencyMode = "balanced";
   CHECK(c.GetEffectiveSafeFrames() == 768);
 
-  c.latencyMode = "safe";
+  c.latencyMode = "balanced";
   CHECK(c.GetEffectiveSafeFrames() == 1024);
 
-  c.latencyMode = "relaxed";
+  c.latencyMode = "safe";
   CHECK(c.GetEffectiveSafeFrames() == 1536);
+
+  c.latencyMode = "relaxed";
+  CHECK(c.GetEffectiveSafeFrames() == 2048);
 
   // AC3 mode
   c.outputMode = "ac3";

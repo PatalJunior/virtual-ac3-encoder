@@ -422,16 +422,24 @@ void WasapiPassthrough::ThreadProc()
       continue;
     }
 
-    // --- drift control (SoundPusher style) ---
+    // --- drift control (SoundPusher style with hysteresis & gentle step-trimming) ---
     const uint32_t avail =
         static_cast<uint32_t>(ring_->BytesAvailable() / capBytesPerFrame_);
     if (avail < minAvail_)
       minAvail_ = avail;
-    if (cycle_++ % 64 == 0)
+
+    // Evaluate drift over a ~2-second window (e.g. 64 cycles for AC3 @ 32ms, 192 cycles for DTS @ 10.6ms)
+    const uint32_t driftCycles = (framesPerPacket_ <= 512) ? 192 : 64;
+    if (cycle_++ % driftCycles == 0)
     {
-      if (minAvail_ != 0xFFFFFFFFu && minAvail_ > desired)
+      // Only trim if the MINIMUM available buffer over the entire window has exceeded desired + hysteresis.
+      // This deadband ensures that normal OS thread scheduling jitter (±3-5 ms) never causes an underrun.
+      const uint32_t hysteresis = framesPerPacket_;
+      if (minAvail_ != 0xFFFFFFFFu && minAvail_ > desired + hysteresis)
       {
-        const uint32_t trim = minAvail_ - desired;
+        const uint32_t excess = minAvail_ - (desired + hysteresis / 2);
+        const uint32_t maxTrim = framesPerPacket_ / 2; // Trim gently in small steps
+        const uint32_t trim = std::min(excess, maxTrim);
         ring_->Discard(static_cast<size_t>(trim) * capBytesPerFrame_);
       }
       minAvail_ = 0xFFFFFFFFu;

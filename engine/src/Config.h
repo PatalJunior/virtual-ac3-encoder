@@ -36,16 +36,16 @@ struct Config
     if (dts)
     {
       // DTS frames are 512 samples. WASAPI shared-mode capture operates on a 480-sample (10 ms) quantum.
-      // A minimum floor of 512 samples is required to prevent packet boundary starvation/stutter.
+      // Generous buffer reserve floors absorb packet boundary jitter and OS thread scheduling latency.
       if (latencyMode == "extreme" || latencyMode == "ultra")
         return 512;
       if (latencyMode == "fast" || latencyMode == "low")
-        return 512;
-      if (latencyMode == "balanced")
         return 768;
-      if (latencyMode == "safe")
+      if (latencyMode == "balanced")
         return 1024;
-      return 1536;
+      if (latencyMode == "safe")
+        return 1536;
+      return 2048;
     }
 
     if (latencyMode == "extreme" || latencyMode == "ultra")
