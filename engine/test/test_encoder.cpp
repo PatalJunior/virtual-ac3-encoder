@@ -196,16 +196,16 @@ TEST_CASE("latency: Config::GetEffectiveSafeFrames scales correctly")
   Config c;
   c.outputMode = "dts";
   c.latencyMode = "extreme";
-  CHECK(c.GetEffectiveSafeFrames() == 128);
-
-  c.latencyMode = "fast";
-  CHECK(c.GetEffectiveSafeFrames() == 256);
-
-  c.latencyMode = "balanced";
   CHECK(c.GetEffectiveSafeFrames() == 512);
 
-  c.latencyMode = "safe";
+  c.latencyMode = "fast";
+  CHECK(c.GetEffectiveSafeFrames() == 512);
+
+  c.latencyMode = "balanced";
   CHECK(c.GetEffectiveSafeFrames() == 768);
+
+  c.latencyMode = "safe";
+  CHECK(c.GetEffectiveSafeFrames() == 1024);
 
   c.latencyMode = "relaxed";
   CHECK(c.GetEffectiveSafeFrames() == 1536);
