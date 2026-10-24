@@ -217,7 +217,14 @@ void WasapiPcmOutput::Stop()
   }
   if (stopEvent_) SetEvent(stopEvent_);
   if (thread_.joinable()) thread_.join();
-  if (client_) client_->Stop();
+  if (client_) {
+    client_->Stop();
+    client_.Reset();
+  }
+  render_.Reset();
+  dev_.Reset();
+  if (stopEvent_) { CloseHandle(stopEvent_); stopEvent_ = nullptr; }
+  if (swr_) { swr_free(&swr_); swr_ = nullptr; }
 }
 
 void WasapiPcmOutput::ApplyStereoGains(uint8_t* data, uint32_t frames)

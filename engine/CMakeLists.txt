@@ -87,7 +87,7 @@ add_executable(engine
   src/WasapiPassthrough.h
   src/WasapiPcmOutput.h
 )
-target_link_libraries(engine PRIVATE ac3core ffmpeg ole32 avrt)
+target_link_libraries(engine PRIVATE ac3core ffmpeg ole32 avrt winmm)
 if(MSVC)
   target_compile_options(engine PRIVATE /permissive-)
 endif()
@@ -123,7 +123,7 @@ target_include_directories(control_center PRIVATE
   "${IMGUI_DIR}"
   "${IMGUI_DIR}/backends"
 )
-target_link_libraries(control_center PRIVATE comctl32 ole32 propsys d3d11 dxgi dwmapi)
+target_link_libraries(control_center PRIVATE comctl32 ole32 propsys d3d11 dxgi dwmapi winmm)
 target_compile_definitions(control_center PRIVATE UNICODE _UNICODE)
 if(MSVC)
   target_compile_options(control_center PRIVATE /W4 /permissive- /utf-8)

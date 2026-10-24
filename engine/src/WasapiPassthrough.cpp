@@ -392,7 +392,15 @@ void WasapiPassthrough::Stop()
   }
   if (stopEvent_) SetEvent(stopEvent_);
   if (thread_.joinable()) thread_.join();
-  if (client_) client_->Stop();
+  if (client_) {
+    client_->Stop();
+    client_.Reset();
+  }
+  render_.Reset();
+  clock_.Reset();
+  dev_.Reset();
+  if (dataEvent_) { CloseHandle(dataEvent_); dataEvent_ = nullptr; }
+  if (stopEvent_) { CloseHandle(stopEvent_); stopEvent_ = nullptr; }
 }
 
 void WasapiPassthrough::ThreadProc()

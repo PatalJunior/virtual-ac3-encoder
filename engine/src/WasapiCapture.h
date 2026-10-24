@@ -54,6 +54,7 @@ private:
   CaptureFormat             fmt_;
 
   bool                      loopback_ = false;
+  bool                      isEventDriven_ = false;
   REFERENCE_TIME            bufferHns_ = 100000;
   HANDLE                    dataEvent_ = nullptr;
   HANDLE                    stopEvent_ = nullptr;

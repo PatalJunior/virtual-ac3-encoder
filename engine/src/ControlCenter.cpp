@@ -391,7 +391,7 @@ bool StartEngine() {
     return true;
 }
 
-void SaveConfiguration() {
+void SaveConfiguration(int reloadId = 0) {
     Kv cfg = ReadKv(g_configPath);
 
     const auto& inDevs = g_loopback ? g_renderDevices : g_captureDevices;
@@ -430,13 +430,12 @@ void SaveConfiguration() {
     cfg["upmix"] = upmixes[std::clamp(g_upmixMode, 0, 2)];
 
     WriteKvAtomic(g_configPath, cfg);
-    WriteControlFile(false, g_reloadId);
+    WriteControlFile(false, reloadId);
 }
 
 void TriggerApplySettings() {
-    SaveConfiguration();
     g_reloadId++;
-    WriteControlFile(false, g_reloadId);
+    SaveConfiguration(g_reloadId);
     if (!EngineRunning()) {
         StartEngine();
     }
@@ -822,6 +821,13 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ShowWindow(hWnd, SW_HIDE);
         return 0; // Minimize to tray instead of quitting
 
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = 760;
+        info->ptMinTrackSize.y = 650;
+        return 0;
+    }
+
     case WM_SIZE:
         if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
             CleanupRenderTarget();
@@ -873,16 +879,35 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
     };
     RegisterClassExW(&wc);
 
-    const int winWidth = 740;
-    const int winHeight = 760;
+    const int winWidth = 780;
+    const int winHeight = 860;
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     const int posX = std::max(0, (screenW - winWidth) / 2);
     const int posY = std::max(0, (screenH - winHeight) / 2);
 
     g_hWnd = CreateWindowW(wc.lpszClassName, L"Virtual AC3 / DTS Control Center",
-                           WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                           WS_OVERLAPPEDWINDOW,
                            posX, posY, winWidth, winHeight, nullptr, nullptr, wc.hInstance, nullptr);
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE_OLD
+#define DWMWA_USE_IMMERSIVE_DARK_MODE_OLD 19
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+
+    if (g_hWnd) {
+        BOOL useDarkMode = TRUE;
+        if (FAILED(DwmSetWindowAttribute(g_hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode)))) {
+            DwmSetWindowAttribute(g_hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, &useDarkMode, sizeof(useDarkMode));
+        }
+        COLORREF captionColor = RGB(0x17, 0x19, 0x1F); // Matches #17191F dark UI background
+        DwmSetWindowAttribute(g_hWnd, DWMWA_CAPTION_COLOR, &captionColor, sizeof(captionColor));
+    }
 
     if (hAppIcon && g_hWnd) {
         SendMessageW(g_hWnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
@@ -964,8 +989,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2(static_cast<float>(rect.right), static_cast<float>(rect.bottom)));
         ImGui::Begin("MainControlPanel", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
 
         // --- 1. Master Power Bar ---
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
@@ -1197,7 +1223,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             }
 
             if (gainsChanged) {
-                WriteControlFile(false, g_reloadId);
+                WriteControlFile(false, 0);
             }
         }
 

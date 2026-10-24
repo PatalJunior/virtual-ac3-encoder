@@ -33,14 +33,29 @@ struct Config
       return safeFrames;
 
     const bool dts = (outputMode == "dts");
+    if (dts)
+    {
+      // DTS frames are 512 samples. WASAPI shared-mode capture operates on a 480-sample (10 ms) quantum.
+      // A minimum floor of 512 samples is required to prevent packet boundary starvation/stutter.
+      if (latencyMode == "extreme" || latencyMode == "ultra")
+        return 512;
+      if (latencyMode == "fast" || latencyMode == "low")
+        return 512;
+      if (latencyMode == "balanced")
+        return 768;
+      if (latencyMode == "safe")
+        return 1024;
+      return 1536;
+    }
+
     if (latencyMode == "extreme" || latencyMode == "ultra")
-      return dts ? 128 : 256;
+      return 256;
     if (latencyMode == "fast" || latencyMode == "low")
-      return dts ? 256 : 512;
+      return 512;
     if (latencyMode == "balanced")
-      return dts ? 512 : 768;
+      return 768;
     if (latencyMode == "safe")
-      return dts ? 768 : 1024;
+      return 1024;
     // "relaxed", "normal", or default
     return 1536;
   }
