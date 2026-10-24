@@ -397,7 +397,6 @@ void WasapiPassthrough::Stop()
     client_.Reset();
   }
   render_.Reset();
-  clock_.Reset();
   dev_.Reset();
   if (dataEvent_) { CloseHandle(dataEvent_); dataEvent_ = nullptr; }
   if (stopEvent_) { CloseHandle(stopEvent_); stopEvent_ = nullptr; }
