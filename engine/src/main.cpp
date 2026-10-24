@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -109,10 +110,11 @@ static void LoadConfigFile(const std::string& path, Config& c)
 struct RuntimeControlState
 {
   bool stop = false;
+  int reloadId = 0;
   std::array<float, 6> gainsDb{{0, 0, 0, 0, 0, 0}};
 };
 
-// The GUI writes this small file atomically. Polling it at 10 Hz avoids blocking the audio thread.
+// The GUI writes this small file atomically. Polling it avoids blocking the audio thread.
 static bool LoadRuntimeControlState(const std::string& path, RuntimeControlState& state)
 {
   std::ifstream f(path);
@@ -130,6 +132,13 @@ static bool LoadRuntimeControlState(const std::string& path, RuntimeControlState
     if (key == "stop")
     {
       state.stop = (value == "1" || value == "true" || value == "yes");
+      continue;
+    }
+    if (key == "reload")
+    {
+      char* end = nullptr;
+      long r = std::strtol(value.c_str(), &end, 10);
+      if (end != value.c_str()) state.reloadId = static_cast<int>(r);
       continue;
     }
     for (size_t i = 0; i < 6; ++i)
@@ -333,62 +342,110 @@ int main(int argc, char** argv)
     return 0;
   }
 
-  ComPtr<IMMDevice> inDev;
-  EndpointInfo inInfo;
-  if (!ResolveCapture(cfg, inDev, inInfo)) return 1;
-  std::printf("Input   : %s %s\n", Narrow(inInfo.name.c_str()).c_str(),
-              cfg.loopback ? "(loopback)" : "(capture)");
-
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
   if (cfg.monitor)
+  {
+    ComPtr<IMMDevice> inDev;
+    EndpointInfo inInfo;
+    if (!ResolveCapture(cfg, inDev, inInfo)) return 1;
     return RunMonitor(cfg, inDev.Get());
-
-  ComPtr<IMMDevice> outDev;
-  EndpointInfo outInfo;
-  if (!ResolveOutput(cfg, outDev, outInfo)) return 1;
-  std::printf("Output  : %s %s\n", Narrow(outInfo.name.c_str()).c_str(), outInfo.isSpdif ? "[SPDIF]" : "");
-
-  WasapiCapture capture;
-  const REFERENCE_TIME capBufferHns =
-      (cfg.latencyMode == "relaxed" || cfg.latencyMode == "safe") ? 200000 : 100000;
-  if (!capture.Init(inDev.Get(), cfg.loopback, capBufferHns)) return 1;
-
-  const CaptureFormat& cf = capture.Format();
-  // Ring sized to ~8 AC3 packets of capture audio (drift absorber).
-  const size_t ringBytes = static_cast<size_t>(8) * 1536 * cf.bytesPerFrame();
-  RingBuffer ring(ringBytes);
-  capture.SetRing(&ring);
-
-  const bool pcmMode = (cfg.outputMode == "pcm");
-  const bool dtsMode = (cfg.outputMode == "dts");
-  const uint32_t effectiveSafe = cfg.GetEffectiveSafeFrames();
-  std::printf("Latency : %s (safeFrames = %u, ~%.1f ms)\n", cfg.latencyMode.c_str(),
-              effectiveSafe, 1000.0 * effectiveSafe / cf.sampleRate);
-
-  WasapiPassthrough ac3Out;
-  WasapiPcmOutput pcmOut;
-  if (pcmMode)
-  {
-    if (!pcmOut.Init(outDev.Get(), &ring, cf, effectiveSafe)) return 1;
-    if (!pcmOut.Start()) { std::fprintf(stderr, "PCM output start failed\n"); return 1; }
   }
-  else
+
+  struct AudioPipeline
   {
-    WasapiPassthrough::Params pp;
-    pp.codec = dtsMode ? SpdifEncoder::Codec::DTS : SpdifEncoder::Codec::AC3;
-    pp.bitRate = cfg.bitRate;
-    pp.dtsBitRate = cfg.dtsBitRate;
-    pp.safeFrames = effectiveSafe;
-    pp.upmixSurround = (cfg.upmix == "surround");
-    if (!ac3Out.Init(outDev.Get(), &ring, cf, pp)) return 1;
-    if (!ac3Out.Start()) { std::fprintf(stderr, "AC3 passthrough start failed\n"); return 1; }
-  }
-  if (!capture.Start())
+    WasapiCapture capture;
+    std::unique_ptr<RingBuffer> ring;
+    WasapiPassthrough ac3Out;
+    WasapiPcmOutput pcmOut;
+    bool isPcm = false;
+    bool running = false;
+
+    bool Start(const Config& c)
+    {
+      Stop();
+
+      ComPtr<IMMDevice> inDev;
+      EndpointInfo inInfo;
+      if (!ResolveCapture(c, inDev, inInfo)) return false;
+      std::printf("Input   : %s %s\n", Narrow(inInfo.name.c_str()).c_str(),
+                  c.loopback ? "(loopback)" : "(capture)");
+
+      ComPtr<IMMDevice> outDev;
+      EndpointInfo outInfo;
+      if (!ResolveOutput(c, outDev, outInfo)) return false;
+      std::printf("Output  : %s %s\n", Narrow(outInfo.name.c_str()).c_str(), outInfo.isSpdif ? "[SPDIF]" : "");
+
+      const REFERENCE_TIME capBufferHns =
+          (c.latencyMode == "relaxed" || c.latencyMode == "safe") ? 200000 : 100000;
+      if (!capture.Init(inDev.Get(), c.loopback, capBufferHns)) return false;
+
+      const CaptureFormat& cf = capture.Format();
+      const size_t ringBytes = static_cast<size_t>(8) * 1536 * cf.bytesPerFrame();
+      ring = std::make_unique<RingBuffer>(ringBytes);
+      capture.SetRing(ring.get());
+
+      isPcm = (c.outputMode == "pcm");
+      const bool dtsMode = (c.outputMode == "dts");
+      const uint32_t effectiveSafe = c.GetEffectiveSafeFrames();
+      std::printf("Mode    : %s\n", isPcm ? "PCM Stereo" : (dtsMode ? "DTS 5.1" : "AC3 5.1"));
+      std::printf("Latency : %s (safeFrames = %u, ~%.1f ms)\n", c.latencyMode.c_str(),
+                  effectiveSafe, 1000.0 * effectiveSafe / cf.sampleRate);
+
+      if (isPcm)
+      {
+        if (!pcmOut.Init(outDev.Get(), ring.get(), cf, effectiveSafe)) return false;
+        if (!pcmOut.Start()) { std::fprintf(stderr, "PCM output start failed\n"); return false; }
+      }
+      else
+      {
+        WasapiPassthrough::Params pp;
+        pp.codec = dtsMode ? SpdifEncoder::Codec::DTS : SpdifEncoder::Codec::AC3;
+        pp.bitRate = c.bitRate;
+        pp.dtsBitRate = c.dtsBitRate;
+        pp.safeFrames = effectiveSafe;
+        if (c.upmix == "always")
+          pp.upmix = SpdifEncoder::Upmix::Always;
+        else if (c.upmix == "surround" || c.upmix == "dynamic")
+          pp.upmix = SpdifEncoder::Upmix::Surround;
+        else
+          pp.upmix = SpdifEncoder::Upmix::Off;
+
+        if (!ac3Out.Init(outDev.Get(), ring.get(), cf, pp)) return false;
+        if (!ac3Out.Start()) { std::fprintf(stderr, "AC3/DTS passthrough start failed\n"); return false; }
+      }
+
+      if (!capture.Start())
+      {
+        std::fprintf(stderr, "capture start failed\n");
+        if (isPcm) pcmOut.Stop(); else ac3Out.Stop();
+        return false;
+      }
+
+      running = true;
+      return true;
+    }
+
+    void Stop()
+    {
+      if (!running) return;
+      capture.Stop();
+      if (isPcm) pcmOut.Stop(); else ac3Out.Stop();
+      ring.reset();
+      running = false;
+    }
+
+    void SetChannelGainsDb(const std::array<float, 6>& gains)
+    {
+      if (isPcm) pcmOut.SetChannelGainsDb(gains);
+      else ac3Out.SetChannelGainsDb(gains);
+    }
+  };
+
+  AudioPipeline pipeline;
+  if (!pipeline.Start(cfg))
   {
-    std::fprintf(stderr, "capture start failed\n");
-    if (pcmMode) pcmOut.Stop(); else ac3Out.Stop();
-    return 1;
+    std::fprintf(stderr, "[Engine] Initial audio start failed. Entering control loop...\n");
   }
 
   if (cfg.durationSeconds > 0)
@@ -398,12 +455,13 @@ int main(int argc, char** argv)
 
   const std::string controlPath = ExeDir() + "\\ac3-control.ini";
   std::array<float, 6> lastGains{{0, 0, 0, 0, 0, 0}};
-  if (pcmMode) pcmOut.SetChannelGainsDb(lastGains);
-  else ac3Out.SetChannelGainsDb(lastGains);
+  pipeline.SetChannelGainsDb(lastGains);
+  int lastReloadId = 0;
   auto start = std::chrono::steady_clock::now();
+
   while (!g_stop.load())
   {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     RuntimeControlState control;
     if (LoadRuntimeControlState(controlPath, control))
     {
@@ -412,10 +470,27 @@ int main(int argc, char** argv)
         g_stop.store(true);
         break;
       }
+      if (control.reloadId != 0 && control.reloadId != lastReloadId)
+      {
+        lastReloadId = control.reloadId;
+        std::printf("\n[Engine] Hot-reload triggered (reloadId=%d). Re-applying settings...\n", lastReloadId);
+        Config newCfg;
+        LoadConfigFile(cfgPath, newCfg);
+        ParseArgs(argc, argv, newCfg);
+        cfg = newCfg;
+        if (!pipeline.Start(cfg))
+        {
+          std::fprintf(stderr, "[Engine] Hot-reload failed; waiting for valid settings...\n");
+        }
+        else
+        {
+          pipeline.SetChannelGainsDb(control.gainsDb);
+          std::printf("[Engine] Hot-reload successful.\n");
+        }
+      }
       if (control.gainsDb != lastGains)
       {
-        if (pcmMode) pcmOut.SetChannelGainsDb(control.gainsDb);
-        else ac3Out.SetChannelGainsDb(control.gainsDb);
+        pipeline.SetChannelGainsDb(control.gainsDb);
         lastGains = control.gainsDb;
       }
     }
@@ -425,7 +500,6 @@ int main(int argc, char** argv)
   }
 
   std::printf("\nStopping...\n");
-  capture.Stop();
-  if (pcmMode) pcmOut.Stop(); else ac3Out.Stop();
+  pipeline.Stop();
   return 0;
 }

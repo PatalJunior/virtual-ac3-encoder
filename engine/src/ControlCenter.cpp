@@ -8,6 +8,10 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <mmreg.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
 
@@ -30,7 +34,19 @@
 // Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+#pragma pack(push, 1)
+struct WAVEFORMATEXTENSIBLE_IEC61937 {
+    WAVEFORMATEXTENSIBLE FormatExt;
+    DWORD dwEncodedSamplesPerSec;
+    DWORD dwEncodedChannelCount;
+    DWORD dwAverageBytesPerSec;
+};
+#pragma pack(pop)
+
 namespace {
+
+static const GUID kGuidSubtypeDolbyDigital = { 0x00000092, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kGuidSubtypeDts = { 0x00000093, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
 constexpr UINT WM_TRAYICON = WM_USER + 101;
 constexpr UINT ID_TRAY_RESTORE = 2001;
@@ -40,6 +56,10 @@ constexpr UINT ID_TRAY_EXIT = 2003;
 struct AudioDevice {
     std::wstring name;
     std::wstring id;
+    bool isSpdif = false;
+    bool supportsAc3 = false;
+    bool supportsDts = false;
+    bool supportsPcm = true;
 };
 using Kv = std::map<std::string, std::string>;
 
@@ -64,6 +84,7 @@ std::vector<AudioDevice> g_captureDevices;
 std::vector<AudioDevice> g_renderDevices;
 int g_selectedInDevice = 0;
 int g_selectedOutDevice = 0;
+bool g_showAllRenderDevices = false;
 
 // Settings
 int g_outputMode = 0; // 0=DTS 5.1, 1=AC3 5.1, 2=PCM Stereo
@@ -73,7 +94,7 @@ int g_latencyPreset = 2; // 0=Extreme, 1=Fast, 2=Balanced, 3=Safe, 4=Relaxed
 int g_upmixMode = 0; // 0=Dynamic Surround (Auto), 1=Always Surround, 2=Off
 bool g_loopback = true;
 bool g_outAutoSpdif = true;
-bool g_configDirty = false;
+int  g_reloadId = 1;
 
 std::array<int, 6> g_gainDb{{0, 0, 0, 0, 0, 0}};
 std::array<bool, 6> g_channelMute{{false, false, false, false, false, false}};
@@ -163,14 +184,56 @@ bool WriteKvAtomic(const std::wstring& path, const Kv& values) {
     return WriteTextAtomic(path, out.str());
 }
 
-bool WriteControlFile(bool stop) {
+bool WriteControlFile(bool stop, int reloadId = 0) {
     std::ostringstream out;
     out << "stop=" << (stop ? 1 : 0) << "\r\n";
+    out << "reload=" << reloadId << "\r\n";
     for (size_t i = 0; i < g_gainDb.size(); ++i) {
         int val = g_channelMute[i] ? -60 : g_gainDb[i];
         out << kGainKeys[i] << '=' << val << "\r\n";
     }
     return WriteTextAtomic(g_controlPath, out.str());
+}
+
+static bool ProbeDeviceFormat(IMMDevice* dev, const GUID& subFormat, int rate) {
+    if (!dev) return false;
+    IAudioClient* client = nullptr;
+    if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client))) || !client)
+        return false;
+
+    WAVEFORMATEXTENSIBLE_IEC61937 w{};
+    w.FormatExt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    w.FormatExt.Format.nChannels = 2;
+    w.FormatExt.Format.nSamplesPerSec = rate;
+    w.FormatExt.Format.wBitsPerSample = 16;
+    w.FormatExt.Format.nBlockAlign = 4;
+    w.FormatExt.Format.nAvgBytesPerSec = rate * 4;
+    w.FormatExt.Samples.wValidBitsPerSample = 16;
+    w.FormatExt.dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
+    w.FormatExt.SubFormat = subFormat;
+
+    // 1. Try extended format (MSDN standard)
+    w.FormatExt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE_IEC61937) - sizeof(WAVEFORMATEX);
+    w.dwEncodedSamplesPerSec = rate;
+    w.dwEncodedChannelCount = 6;
+    w.dwAverageBytesPerSec = 0;
+    HRESULT hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &w.FormatExt.Format, nullptr);
+    if (hr == S_OK) {
+        client->Release();
+        return true;
+    }
+
+    // 2. Try non-extended format (Kodi / broad compatibility)
+    w.FormatExt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &w.FormatExt.Format, nullptr);
+    client->Release();
+    return (hr == S_OK);
+}
+
+bool IsOutputAllowedForMode(const AudioDevice& dev, int mode) {
+    if (mode == 0) return dev.supportsDts;
+    if (mode == 1) return dev.supportsAc3;
+    return dev.supportsPcm;
 }
 
 // Device enumeration
@@ -192,6 +255,7 @@ std::vector<AudioDevice> EnumerateDevices(EDataFlow flow) {
             IPropertyStore* store = nullptr;
             std::wstring name = L"(unnamed audio device)";
             std::wstring deviceId;
+            bool isSpdif = false;
             if (SUCCEEDED(device->GetId(&id)) && id) deviceId = id;
             if (id) CoTaskMemFree(id);
             if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && store) {
@@ -200,9 +264,32 @@ std::vector<AudioDevice> EnumerateDevices(EDataFlow flow) {
                 if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal)
                     name = pv.pwszVal;
                 PropVariantClear(&pv);
+
+                PropVariantInit(&pv);
+                if (SUCCEEDED(store->GetValue(PKEY_AudioEndpoint_FormFactor, &pv)) && pv.vt == VT_UI4)
+                    isSpdif = (pv.ulVal == 5 /* SPDIF */);
+                PropVariantClear(&pv);
+
                 store->Release();
             }
-            if (!deviceId.empty()) result.push_back({name, deviceId});
+
+            bool supportsAc3 = false;
+            bool supportsDts = false;
+            if (flow == eRender) {
+                supportsAc3 = ProbeDeviceFormat(device, kGuidSubtypeDolbyDigital, 48000);
+                supportsDts = ProbeDeviceFormat(device, kGuidSubtypeDts, 48000);
+            }
+
+            if (!deviceId.empty()) {
+                AudioDevice dev;
+                dev.name = name;
+                dev.id = deviceId;
+                dev.isSpdif = isSpdif;
+                dev.supportsAc3 = supportsAc3;
+                dev.supportsDts = supportsDts;
+                dev.supportsPcm = true;
+                result.push_back(dev);
+            }
             device->Release();
         }
         collection->Release();
@@ -342,12 +429,20 @@ void SaveConfiguration() {
     cfg["latency"] = latencies[std::clamp(g_latencyPreset, 0, 4)];
     cfg.erase("safe"); // Use preset
 
-    const char* upmixes[] = {"surround", "surround", "off"};
+    const char* upmixes[] = {"dynamic", "always", "off"};
     cfg["upmix"] = upmixes[std::clamp(g_upmixMode, 0, 2)];
 
     WriteKvAtomic(g_configPath, cfg);
-    WriteControlFile(false);
-    g_configDirty = false;
+    WriteControlFile(false, g_reloadId);
+}
+
+void TriggerApplySettings() {
+    SaveConfiguration();
+    g_reloadId++;
+    WriteControlFile(false, g_reloadId);
+    if (!EngineRunning()) {
+        StartEngine();
+    }
 }
 
 void LoadConfiguration() {
@@ -389,7 +484,8 @@ void LoadConfiguration() {
 
     const std::string up = cfg["upmix"];
     if (up == "off") g_upmixMode = 2;
-    else g_upmixMode = 0; // dynamic surround
+    else if (up == "always") g_upmixMode = 1;
+    else g_upmixMode = 0; // dynamic surround (or legacy "surround")
 
     // Read control gains
     std::ifstream in{std::filesystem::path(g_controlPath)};
@@ -586,22 +682,28 @@ void DrawSpeakerVUMeters(bool isRunning) {
         // Static horizontal position for channel i (never moves or fluctuates)
         const float colStartX = startPos.x + static_cast<float>(i) * (colWidth + colSpacing);
 
-        // Decay ballistics
-        const float peak = rawPeaks[i];
-        if (peak >= g_smoothedPeaks[i]) {
-            g_smoothedPeaks[i] = peak;
+        // Studio ballistics: fast attack (~15 ms) and time-based exponential release (~20 dB/s)
+        const float dt = ImGui::GetIO().DeltaTime;
+        const float attackRate = std::clamp(dt * 60.0f, 0.15f, 1.0f);
+        const float decayFactor = std::exp(-dt * 4.5f);
+
+        const float targetPeak = rawPeaks[i];
+        if (targetPeak >= g_smoothedPeaks[i]) {
+            g_smoothedPeaks[i] += (targetPeak - g_smoothedPeaks[i]) * attackRate;
         } else {
-            g_smoothedPeaks[i] = std::max(0.0f, g_smoothedPeaks[i] - 0.035f); // Smooth falloff
+            g_smoothedPeaks[i] *= decayFactor;
+            if (g_smoothedPeaks[i] < 0.0001f) g_smoothedPeaks[i] = 0.0f;
         }
 
         // Peak-hold indicator
-        if (peak >= g_peakHold[i]) {
-            g_peakHold[i] = peak;
-            g_peakHoldFrames[i] = 45; // Hold for 45 frames (~0.75s)
+        if (targetPeak >= g_peakHold[i]) {
+            g_peakHold[i] = targetPeak;
+            g_peakHoldFrames[i] = 45; // Hold for ~0.75s
         } else if (g_peakHoldFrames[i] > 0) {
             g_peakHoldFrames[i]--;
         } else {
-            g_peakHold[i] = std::max(0.0f, g_peakHold[i] - 0.02f);
+            g_peakHold[i] *= std::exp(-dt * 2.5f);
+            if (g_peakHold[i] < 0.0001f) g_peakHold[i] = 0.0f;
         }
 
         const float linearVal = g_smoothedPeaks[i];
@@ -907,10 +1009,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
         if (ImGui::CollapsingHeader("AUDIO ROUTING & FORMAT", ImGuiTreeNodeFlags_DefaultOpen)) {
             // Loopback Capture Toggle
             if (ImGui::Checkbox("WASAPI Loopback Capture (Play to CABLE Input, capture directly)", &g_loopback)) {
-                g_configDirty = true;
                 const auto& newDevs = g_loopback ? g_renderDevices : g_captureDevices;
                 g_selectedInDevice = FindDeviceBySubstring(newDevs, g_loopback ? "CABLE Input" : "CABLE Output");
                 if (g_selectedInDevice < 0 && !newDevs.empty()) g_selectedInDevice = 0;
+                TriggerApplySettings();
             }
             ImGui::SameLine();
             ImGui::TextDisabled(g_loopback ? "(Captures Playback device, e.g. CABLE Input)" : "(Captures Recording endpoint, e.g. Mics / CABLE Output)");
@@ -926,7 +1028,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
                     const bool isSel = (g_selectedInDevice == i);
                     if (ImGui::Selectable(ToUtf8(inDevs[static_cast<size_t>(i)].name).c_str(), isSel)) {
                         g_selectedInDevice = i;
-                        g_configDirty = true;
+                        TriggerApplySettings();
                     }
                     if (isSel) ImGui::SetItemDefaultFocus();
                 }
@@ -934,28 +1036,54 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             }
 
             // Output S/PDIF Device
-            std::string outCurrentName = g_outAutoSpdif
-                ? "[Auto-Detect First S/PDIF Optical Port] (out_spdif=1)"
-                : ((g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size())
-                    ? ToUtf8(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)].name) : "Select Output...");
+            std::vector<int> compatibleIndices;
+            for (int i = 0; i < static_cast<int>(g_renderDevices.size()); ++i) {
+                if (g_showAllRenderDevices || IsOutputAllowedForMode(g_renderDevices[static_cast<size_t>(i)], g_outputMode)) {
+                    compatibleIndices.push_back(i);
+                }
+            }
+
+            std::string outCurrentName;
+            if (g_outAutoSpdif) {
+                outCurrentName = "[Auto-Detect First S/PDIF Optical Port] (out_spdif=1)";
+            } else if (g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size()) {
+                const auto& dev = g_renderDevices[static_cast<size_t>(g_selectedOutDevice)];
+                outCurrentName = ToUtf8(dev.name);
+                if (dev.isSpdif) outCurrentName += " [SPDIF]";
+            } else {
+                outCurrentName = "Select Output...";
+            }
+
             if (ImGui::BeginCombo("Digital Output (S/PDIF)", outCurrentName.c_str())) {
                 const bool isAutoSel = g_outAutoSpdif;
                 if (ImGui::Selectable("[Auto-Detect First S/PDIF Optical Port] (Recommended)", isAutoSel)) {
                     g_outAutoSpdif = true;
-                    g_configDirty = true;
+                    TriggerApplySettings();
                 }
                 if (isAutoSel) ImGui::SetItemDefaultFocus();
 
                 ImGui::Separator();
 
-                for (int i = 0; i < static_cast<int>(g_renderDevices.size()); ++i) {
-                    const bool isSel = (!g_outAutoSpdif && g_selectedOutDevice == i);
-                    if (ImGui::Selectable(ToUtf8(g_renderDevices[static_cast<size_t>(i)].name).c_str(), isSel)) {
-                        g_outAutoSpdif = false;
-                        g_selectedOutDevice = i;
-                        g_configDirty = true;
+                if (compatibleIndices.empty()) {
+                    ImGui::TextDisabled("  (No devices found supporting this mode)");
+                } else {
+                    for (int i : compatibleIndices) {
+                        const bool isSel = (!g_outAutoSpdif && g_selectedOutDevice == i);
+                        const auto& dev = g_renderDevices[static_cast<size_t>(i)];
+                        std::string devLabel = ToUtf8(dev.name);
+                        if (dev.isSpdif) devLabel += " [SPDIF]";
+                        if (dev.supportsDts && dev.supportsAc3) devLabel += " (DTS+AC3)";
+                        else if (dev.supportsDts) devLabel += " (DTS)";
+                        else if (dev.supportsAc3) devLabel += " (AC3)";
+                        else devLabel += " (PCM Only)";
+
+                        if (ImGui::Selectable(devLabel.c_str(), isSel)) {
+                            g_outAutoSpdif = false;
+                            g_selectedOutDevice = i;
+                            TriggerApplySettings();
+                        }
+                        if (isSel) ImGui::SetItemDefaultFocus();
                     }
-                    if (isSel) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
@@ -965,22 +1093,29 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
                 RefreshDevices();
             }
 
+            ImGui::Checkbox("Show all system audio outputs (including incompatible / analog)", &g_showAllRenderDevices);
+
             // Output Format
             const char* modes[] = { "DTS 5.1 Surround", "Dolby Digital 5.1 (AC3)", "PCM Stereo 2.0 (Pass-through)" };
             if (ImGui::Combo("Encoder Mode", &g_outputMode, modes, IM_ARRAYSIZE(modes))) {
-                g_configDirty = true;
+                if (!g_outAutoSpdif && g_selectedOutDevice >= 0 && static_cast<size_t>(g_selectedOutDevice) < g_renderDevices.size()) {
+                    if (!IsOutputAllowedForMode(g_renderDevices[static_cast<size_t>(g_selectedOutDevice)], g_outputMode)) {
+                        g_outAutoSpdif = true; // Fallback to auto if selected device is incompatible
+                    }
+                }
+                TriggerApplySettings();
             }
 
             // Bitrates
             if (g_outputMode == 0) { // DTS
                 const char* dtsRates[] = { "1536 kbps (Full-Rate Core - Maximum Fidelity)", "768 kbps (Half-Rate Core - High Compatibility)" };
                 if (ImGui::Combo("DTS Bitrate", &g_dtsBitrate, dtsRates, IM_ARRAYSIZE(dtsRates))) {
-                    g_configDirty = true;
+                    TriggerApplySettings();
                 }
             } else if (g_outputMode == 1) { // AC3
                 const char* ac3Rates[] = { "640 kbps (Maximum Optical Quality)", "448 kbps (Standard DVD Rate)" };
                 if (ImGui::Combo("AC3 Bitrate", &g_ac3Bitrate, ac3Rates, IM_ARRAYSIZE(ac3Rates))) {
-                    g_configDirty = true;
+                    TriggerApplySettings();
                 }
             }
 
@@ -993,7 +1128,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
                 "Relaxed (~35 ms / 1536 smp) - Conservative / Laptop"
             };
             if (ImGui::Combo("Latency Preset", &g_latencyPreset, latencies, IM_ARRAYSIZE(latencies))) {
-                g_configDirty = true;
+                TriggerApplySettings();
             }
 
             // Stereo Upmixing
@@ -1003,19 +1138,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
                 "Off (Plain Multichannel Passthrough / Front Stereo Only)"
             };
             if (ImGui::Combo("Stereo Upmix", &g_upmixMode, upmixes, IM_ARRAYSIZE(upmixes))) {
-                g_configDirty = true;
+                TriggerApplySettings();
             }
 
-            // Apply Button if settings changed
-            if (g_configDirty) {
-                ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.15f, 1.0f));
-                if (ImGui::Button("APPLY SETTINGS & RESTART ENCODER", ImVec2(-1, 32))) {
-                    SaveConfiguration();
-                    if (isRunning) StartEngine();
-                }
-                ImGui::PopStyleColor();
-            }
+            ImGui::Spacing();
+            const char* activeModeStr = (g_outputMode == 0) ? "DTS 5.1" : ((g_outputMode == 1) ? "Dolby Digital (AC3)" : "PCM Stereo");
+            ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.65f, 1.0f), "[Settings Active: %s | %s Latency]", activeModeStr, latencies[g_latencyPreset]);
         }
 
         ImGui::Spacing();
@@ -1072,7 +1200,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
             }
 
             if (gainsChanged) {
-                WriteControlFile(false);
+                WriteControlFile(false, g_reloadId);
             }
         }
 

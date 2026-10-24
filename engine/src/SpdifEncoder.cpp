@@ -183,7 +183,8 @@ bool SpdifEncoder::Init(const Params& p)
   // Input conditioning: either the `surround` upmix filter (stereo->5.1) or plain swr
   // convert/downmix. When input is already multichannel but upmix is requested, use
   // "dynamic" mode: keep both paths live and detect stereo content at runtime.
-  const bool wantUpmix = (p.upmix == Upmix::Surround);
+  const bool wantUpmix = (p.upmix == Upmix::Surround || p.upmix == Upmix::Always);
+  alwaysUpmix_ = (p.upmix == Upmix::Always);
   useFilter_ = (wantUpmix && inLayout_.nb_channels <= 2);
   dynamicUpmix_ = (wantUpmix && inLayout_.nb_channels > 2);
 
@@ -269,6 +270,7 @@ void SpdifEncoder::Close()
   useFilter_ = false;
   useDts_ = false;
   dynamicUpmix_ = false;
+  alwaysUpmix_ = false;
   effectivelyStereo_ = true;
   av_channel_layout_uninit(&filterInLayout_);
   stereoExtract_.clear();
@@ -406,7 +408,7 @@ int SpdifEncoder::EncodePacket(const uint8_t* in, uint8_t* outBuf, int outSize)
     if (!FeedFilter(stereoExtract_.data()))
       return -1;
 
-    if (IsEffectivelyStereo(in))
+    if (alwaysUpmix_ || IsEffectivelyStereo(in))
     {
       const int excess = av_audio_fifo_size(fifo_) - 3 * framesPerPacket_;
       if (excess > 0)
@@ -513,77 +515,95 @@ bool SpdifEncoder::IsEffectivelyStereo(const uint8_t* in) const
   if (ch <= 2)
     return true;
 
-  double frontSumSq = 0.0;
-  double otherSumSq = 0.0;
+  // In 5.1 / 7.1 multichannel streams, check whether the surround channels (SL/SR: index 4 and 5)
+  // carry discrete audio energy. In true 5.1 content (games, movies), rears are active.
+  // In stereo padded to 5.1 (Spotify) or 3.0 voice chat (Discord FL+FR+Center), rears are silent.
+  // When rears are silent (< -60 dB), dynamic upmix steers the audio to all 5.1 speakers.
+  double surroundSumSq = 0.0;
+  int surroundChannels = 0;
 
-  if (inSampleFmt_ == AV_SAMPLE_FMT_FLT)
+  if (ch >= 6)
   {
-    const float* f = reinterpret_cast<const float*>(in);
-    for (int i = 0; i < framesPerPacket_; ++i)
+    surroundChannels = ch - 4; // channels 4 and above are surround channels (SL, SR, BL, BR)
+    if (inSampleFmt_ == AV_SAMPLE_FMT_FLT)
     {
-      const float l = f[i * ch + 0];
-      const float r = f[i * ch + 1];
-      frontSumSq += l * l + r * r;
-      for (int c = 2; c < ch; ++c)
+      const float* f = reinterpret_cast<const float*>(in);
+      for (int i = 0; i < framesPerPacket_; ++i)
       {
-        const float v = f[i * ch + c];
-        otherSumSq += v * v;
+        for (int c = 4; c < ch; ++c)
+        {
+          const float v = f[i * ch + c];
+          surroundSumSq += static_cast<double>(v) * v;
+        }
+      }
+    }
+    else if (inSampleFmt_ == AV_SAMPLE_FMT_S16)
+    {
+      const int16_t* s = reinterpret_cast<const int16_t*>(in);
+      for (int i = 0; i < framesPerPacket_; ++i)
+      {
+        for (int c = 4; c < ch; ++c)
+        {
+          const double v = s[i * ch + c] / 32768.0;
+          surroundSumSq += v * v;
+        }
+      }
+    }
+    else if (inSampleFmt_ == AV_SAMPLE_FMT_S32)
+    {
+      const int32_t* s = reinterpret_cast<const int32_t*>(in);
+      for (int i = 0; i < framesPerPacket_; ++i)
+      {
+        for (int c = 4; c < ch; ++c)
+        {
+          const double v = s[i * ch + c] / 2147483648.0;
+          surroundSumSq += v * v;
+        }
       }
     }
   }
-  else if (inSampleFmt_ == AV_SAMPLE_FMT_S16)
+  else
   {
-    const int16_t* s = reinterpret_cast<const int16_t*>(in);
-    for (int i = 0; i < framesPerPacket_; ++i)
-    {
-      const double l = s[i * ch + 0] / 32768.0;
-      const double r = s[i * ch + 1] / 32768.0;
-      frontSumSq += l * l + r * r;
-      for (int c = 2; c < ch; ++c)
-      {
-        const double v = s[i * ch + c] / 32768.0;
-        otherSumSq += v * v;
-      }
-    }
-  }
-  else if (inSampleFmt_ == AV_SAMPLE_FMT_S32)
-  {
-    const int32_t* s = reinterpret_cast<const int32_t*>(in);
-    for (int i = 0; i < framesPerPacket_; ++i)
-    {
-      const double l = s[i * ch + 0] / 2147483648.0;
-      const double r = s[i * ch + 1] / 2147483648.0;
-      frontSumSq += l * l + r * r;
-      for (int c = 2; c < ch; ++c)
-      {
-        const double v = s[i * ch + c] / 2147483648.0;
-        otherSumSq += v * v;
-      }
-    }
+    // Less than 6 channels (e.g. 3.0 or 4.0): lacks standard 5.1 rear surrounds
+    effectivelyStereo_ = true;
+    return true;
   }
 
-  const double otherRms = std::sqrt(otherSumSq / (framesPerPacket_ * (ch - 2)));
-  if (otherRms >= 0.001)
+  const double surroundRms = std::sqrt(surroundSumSq / (framesPerPacket_ * surroundChannels));
+  if (surroundRms >= 0.001) // -60 dB threshold
   {
     effectivelyStereo_ = false;
-    return false;
+    return false; // Active surround content detected (pass discrete 5.1 untouched)
   }
 
-  const double frontRms = std::sqrt(frontSumSq / (framesPerPacket_ * 2));
-  if (frontRms < 0.001)
-    return effectivelyStereo_;
-
   effectivelyStereo_ = true;
-  return true;
+  return true; // Surround channels are silent -> Upmix to 5.1!
 }
 
 void SpdifEncoder::ExtractStereo(const uint8_t* in, uint8_t* out) const
 {
   const int ch = inLayout_.nb_channels;
   const int bps = av_get_bytes_per_sample(inSampleFmt_);
+
+  // If Center channel (index 2) is present (e.g. Discord 3-channel dialogue),
+  // fold down Center at -3 dB (0.7071) into FL and FR so the upmixer can reconstruct
+  // centered dialogue and ambience without losing voice volume.
+  if (inSampleFmt_ == AV_SAMPLE_FMT_FLT && ch >= 3)
+  {
+    const float* src = reinterpret_cast<const float*>(in);
+    float* dst = reinterpret_cast<float*>(out);
+    const float kCenterFactor = 0.70710678f;
+    for (int i = 0; i < framesPerPacket_; ++i)
+    {
+      const float center = src[i * ch + 2] * kCenterFactor;
+      dst[i * 2 + 0] = src[i * ch + 0] + center;
+      dst[i * 2 + 1] = src[i * ch + 1] + center;
+    }
+    return;
+  }
+
   const int inStride = ch * bps;
   const int outStride = 2 * bps;
-
   for (int i = 0; i < framesPerPacket_; ++i)
     std::memcpy(out + i * outStride, in + i * inStride, static_cast<size_t>(outStride));
 }

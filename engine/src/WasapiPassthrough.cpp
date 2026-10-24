@@ -146,7 +146,8 @@ bool WasapiPassthrough::Init(IMMDevice* dev, RingBuffer* ring, const CaptureForm
   ep.bitRate = params_.bitRate;
   ep.dtsBitRate = params_.dtsBitRate;
   ep.inSampleFmt = inFmt;
-  ep.upmix = params_.upmixSurround ? SpdifEncoder::Upmix::Surround : SpdifEncoder::Upmix::Off;
+  ep.upmix = (params_.upmix != SpdifEncoder::Upmix::Off) ? params_.upmix
+           : (params_.upmixSurround ? SpdifEncoder::Upmix::Surround : SpdifEncoder::Upmix::Off);
   if (capFmt.channelMask)
     av_channel_layout_from_mask(&ep.inLayout, capFmt.channelMask);
   else
@@ -285,10 +286,11 @@ bool WasapiPassthrough::InitExclusive(int rate)
   return true;
 }
 
-void WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
+bool WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
 {
   const size_t pktBytes = staging_.size();
   size_t outOff = 0;
+  bool hadAudio = false;
   for (int b = 0; b < burstsPerCycle_; ++b)
   {
     const uint8_t* in;
@@ -296,6 +298,7 @@ void WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
     {
       ring_->Read(staging_.data(), pktBytes);
       in = staging_.data();
+      hadAudio = true;
     }
     else
     {
@@ -324,6 +327,7 @@ void WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
   const size_t totalBytes = static_cast<size_t>(bufferFrames_) * kCarrierBytesPerFrame;
   if (outOff < totalBytes)
     std::memset(out + outOff, 0, totalBytes - outOff); // inter-burst stuffing
+  return hadAudio;
 }
 
 bool WasapiPassthrough::Start()
@@ -338,7 +342,7 @@ bool WasapiPassthrough::Start()
   BYTE* out = nullptr;
   if (SUCCEEDED(render_->GetBuffer(bufferFrames_, &out)))
   {
-    EncodeIntoBuffer(out);
+    const bool hadAudio = EncodeIntoBuffer(out);
     render_->ReleaseBuffer(bufferFrames_, 0);
 
     if (sharedMem_.IsOpen())
@@ -346,7 +350,10 @@ bool WasapiPassthrough::Start()
       MeterSharedState* ms = sharedMem_.Get();
       if (ms)
       {
-        enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        if (hadAudio)
+        {
+          enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        }
         ms->active = 1;
         ms->frameCounter++;
       }
@@ -430,7 +437,7 @@ void WasapiPassthrough::ThreadProc()
       std::fprintf(stderr, "[WasapiPassthrough] GetBuffer failed: %s\n", HrStr(hr).c_str());
       break;
     }
-    EncodeIntoBuffer(out);
+    const bool hadAudio = EncodeIntoBuffer(out);
     render_->ReleaseBuffer(bufferFrames_, 0);
 
     if (sharedMem_.IsOpen())
@@ -438,7 +445,10 @@ void WasapiPassthrough::ThreadProc()
       MeterSharedState* ms = sharedMem_.Get();
       if (ms)
       {
-        enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        if (hadAudio)
+        {
+          enc_.GetChannelLevels(ms->peakLevels, ms->rmsLevels);
+        }
         ms->active = 1;
         ms->frameCounter++;
       }

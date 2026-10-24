@@ -291,3 +291,97 @@ TEST_CASE("dynamic upmix: real 5.1 content passes through unchanged")
   for (int c = 0; c < 6; ++c)
     CHECK(rms[c] > 0.01);
 }
+
+// Discord / VoIP 3-channel case: voice dialogue is active on Front Left, Front Right, and Center,
+// but rear surrounds (BL, BR) are silent. Dynamic upmix MUST detect that rear surrounds are silent
+// and upmix to produce energy on the rear surround channels.
+TEST_CASE("dynamic upmix: 3-channel VoIP/Discord audio gets steered to rear surrounds")
+{
+  SpdifEncoder::Params p;
+  p.sampleRate = 48000;
+  p.inSampleFmt = AV_SAMPLE_FMT_FLT;
+  p.upmix = SpdifEncoder::Upmix::Surround; // dynamic mode
+  AVChannelLayout lay51 = AV_CHANNEL_LAYOUT_5POINT1_BACK;
+  av_channel_layout_copy(&p.inLayout, &lay51);
+  SpdifEncoder enc;
+  bool ok = enc.Init(p);
+  av_channel_layout_uninit(&p.inLayout);
+  REQUIRE(ok);
+
+  const int fpp = enc.FramesPerPacket();
+  const int ch = 6;
+  std::vector<float> in(static_cast<size_t>(fpp) * ch, 0.0f);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+  std::vector<uint8_t> stream;
+  long long t = 0;
+  for (int pk = 0; pk < 24; ++pk)
+  {
+    for (int i = 0; i < fpp; ++i)
+    {
+      float s = 0.3f * static_cast<float>(std::sin(2.0 * kPi * 440.0 * double(t + i) / 48000.0));
+      in[static_cast<size_t>(i) * ch + 0] = s;         // FL
+      in[static_cast<size_t>(i) * ch + 1] = -s;        // FR (anti-phase)
+      in[static_cast<size_t>(i) * ch + 2] = 0.25f * s; // Center dialogue (active!)
+      in[static_cast<size_t>(i) * ch + 3] = 0.0f;      // LFE
+      in[static_cast<size_t>(i) * ch + 4] = 0.0f;      // BL (silent on Discord)
+      in[static_cast<size_t>(i) * ch + 5] = 0.0f;      // BR (silent on Discord)
+    }
+    t += fpp;
+    int n = enc.EncodePacket(reinterpret_cast<uint8_t*>(in.data()), out.data(),
+                             static_cast<int>(out.size()));
+    if (n > 0) stream.insert(stream.end(), out.data(), out.data() + n);
+  }
+  REQUIRE(stream.size() > static_cast<size_t>(6144) * 4);
+
+  std::vector<double> rms = DecodeSpdifAc3Rms(stream.data(), static_cast<int>(stream.size()));
+  REQUIRE(rms.size() >= 6);
+
+  const double surrRms = 0.5 * (rms[4] + rms[5]);
+  MESSAGE("Discord 3-channel dynamic upmix surround-channel RMS: " << surrRms);
+  // Surrounds must receive synthesized audio rather than staying silent!
+  CHECK(surrRms > 0.03);
+}
+
+// Test Upmix::Always forces upmixing on all inputs
+TEST_CASE("upmix always: forces surround upmix unconditionally")
+{
+  SpdifEncoder::Params p;
+  p.sampleRate = 48000;
+  p.inSampleFmt = AV_SAMPLE_FMT_FLT;
+  p.upmix = SpdifEncoder::Upmix::Always;
+  AVChannelLayout lay51 = AV_CHANNEL_LAYOUT_5POINT1_BACK;
+  av_channel_layout_copy(&p.inLayout, &lay51);
+  SpdifEncoder enc;
+  bool ok = enc.Init(p);
+  av_channel_layout_uninit(&p.inLayout);
+  REQUIRE(ok);
+
+  const int fpp = enc.FramesPerPacket();
+  const int ch = 6;
+  std::vector<float> in(static_cast<size_t>(fpp) * ch, 0.0f);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+  std::vector<uint8_t> stream;
+  long long t = 0;
+  for (int pk = 0; pk < 24; ++pk)
+  {
+    for (int i = 0; i < fpp; ++i)
+    {
+      float s = 0.3f * static_cast<float>(std::sin(2.0 * kPi * 440.0 * double(t + i) / 48000.0));
+      in[static_cast<size_t>(i) * ch + 0] = s;
+      in[static_cast<size_t>(i) * ch + 1] = -s;
+      in[static_cast<size_t>(i) * ch + 2] = s;
+      in[static_cast<size_t>(i) * ch + 3] = 0.0f;
+      in[static_cast<size_t>(i) * ch + 4] = 0.05f * s; // Even with slight rear signal
+      in[static_cast<size_t>(i) * ch + 5] = 0.05f * s;
+    }
+    t += fpp;
+    int n = enc.EncodePacket(reinterpret_cast<uint8_t*>(in.data()), out.data(),
+                             static_cast<int>(out.size()));
+    if (n > 0) stream.insert(stream.end(), out.data(), out.data() + n);
+  }
+  REQUIRE(stream.size() > static_cast<size_t>(6144) * 4);
+
+  std::vector<double> rms = DecodeSpdifAc3Rms(stream.data(), static_cast<int>(stream.size()));
+  REQUIRE(rms.size() >= 6);
+  CHECK(0.5 * (rms[4] + rms[5]) > 0.03);
+}

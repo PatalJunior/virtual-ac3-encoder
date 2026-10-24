@@ -31,7 +31,8 @@ public:
     int64_t  bitRate = 640000;
     int64_t  dtsBitRate = 1536000;
     uint32_t safeFrames = 1536;    // target excess frames kept buffered (latency vs. safety)
-    bool     upmixSurround = false; // stereo->5.1 via the `surround` filter (else swr default)
+    SpdifEncoder::Upmix upmix = SpdifEncoder::Upmix::Off;
+    bool     upmixSurround = false; // legacy compatibility flag (mapped to upmix if true)
   };
 
   WasapiPassthrough() = default;
@@ -53,7 +54,7 @@ public:
 
 private:
   bool InitExclusive(int rate);
-  void EncodeIntoBuffer(BYTE* out); // fills one full WASAPI buffer with bursts (+ stuffing)
+  bool EncodeIntoBuffer(BYTE* out); // fills one full WASAPI buffer with bursts (+ stuffing); returns true if non-underrun
   void ThreadProc();
 
   ComPtr<IMMDevice>          dev_;

@@ -284,5 +284,50 @@ TEST_CASE("telemetry: MeterSharedMemory IPC producer and consumer transfer data"
   producer.Close();
 }
 
+TEST_CASE("telemetry: RuntimeControlState parsing handles reload and gain trims")
+{
+  // Test parsing logic matching engine's LoadRuntimeControlState
+  struct ControlState
+  {
+    bool stop = false;
+    int reloadId = 0;
+    std::array<float, 6> gainsDb{{0, 0, 0, 0, 0, 0}};
+  } state;
+
+  auto parseControl = [](const std::string& text, ControlState& s) {
+    const char* keys[6] = {"fl_db", "fr_db", "c_db", "lfe_db", "sl_db", "sr_db"};
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line))
+    {
+      const size_t eq = line.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string key = line.substr(0, eq);
+      const std::string val = line.substr(eq + 1);
+      if (key == "stop") s.stop = (val == "1");
+      else if (key == "reload") s.reloadId = std::stoi(val);
+      for (size_t i = 0; i < 6; ++i)
+      {
+        if (key == keys[i]) {
+          s.gainsDb[i] = std::stof(val);
+          break;
+        }
+      }
+    }
+  };
+
+  std::string ini = "stop=0\nreload=15\nfl_db=-3.5\nfr_db=-3.5\nc_db=0\nlfe_db=-10\nsl_db=-60\nsr_db=0\n";
+  parseControl(ini, state);
+
+  CHECK(state.stop == false);
+  CHECK(state.reloadId == 15);
+  CHECK(state.gainsDb[0] == doctest::Approx(-3.5f));
+  CHECK(state.gainsDb[1] == doctest::Approx(-3.5f));
+  CHECK(state.gainsDb[2] == doctest::Approx(0.0f));
+  CHECK(state.gainsDb[3] == doctest::Approx(-10.0f));
+  CHECK(state.gainsDb[4] == doctest::Approx(-60.0f));
+  CHECK(state.gainsDb[5] == doctest::Approx(0.0f));
+}
+
 // (The surround upmix is covered by a meaningful behavioral test in test_upmix.cpp:
 //  it decodes the AC3 output and checks that energy actually lands in the surround channels.)

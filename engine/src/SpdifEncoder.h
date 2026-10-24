@@ -39,14 +39,16 @@ public:
   SpdifEncoder(const SpdifEncoder&) = delete;
   SpdifEncoder& operator=(const SpdifEncoder&) = delete;
 
-  // Stereo->5.1 upmix mode. For <=2ch input, applies directly. For multichannel input
-  // (e.g. 5.1 cable), "Surround" triggers dynamic detection: if only FL+FR carry signal
-  // (stereo source padded by Windows), the stereo content is upmixed; otherwise
-  // multichannel content passes through via swr.
+  // Stereo->5.1 upmix mode.
+  // - Off: swr default rematrix (front channels only-ish)
+  // - Surround / Dynamic: auto-detects non-surround sources (rear surrounds silent, e.g. Spotify stereo
+  //   or Discord 3-channel dialogue) and synthesizes 5.1 surround; passes genuine 5.1 untouched.
+  // - Always: forces 5.1 surround upmixing unconditionally on all inputs.
   enum class Upmix
   {
-    Off,       // swr default rematrix (front channels only-ish)
-    Surround,  // FFmpeg `surround` libavfilter (FFT-based steered upmix)
+    Off,
+    Surround,
+    Always,
   };
 
   struct Params
@@ -125,6 +127,7 @@ private:
   // whether the content is actually stereo (non-FL/FR channels silent) and upmix it.
   // Both the filter graph (stereo input) and swr (multichannel passthrough) stay live.
   bool             dynamicUpmix_ = false;
+  bool             alwaysUpmix_ = false;
   mutable bool     effectivelyStereo_ = true;
   AVChannelLayout  filterInLayout_{}; // layout fed to the filter graph (stereo in dynamic mode)
   std::vector<uint8_t> stereoExtract_; // buffer for extracted FL+FR frames
