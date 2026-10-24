@@ -108,6 +108,7 @@ stage_ffmpeg_dlls(engine)
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/imgui")
 add_executable(control_center WIN32
   src/ControlCenter.cpp
+  src/Guids.cpp
   src/app.rc
   "${IMGUI_DIR}/imgui.cpp"
   "${IMGUI_DIR}/imgui_draw.cpp"
