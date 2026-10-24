@@ -385,3 +385,49 @@ TEST_CASE("upmix always: forces surround upmix unconditionally")
   REQUIRE(rms.size() >= 6);
   CHECK(0.5 * (rms[4] + rms[5]) > 0.03);
 }
+
+// 3.1 Front Stage mode: sends dialogue/vocals to Center and bass to Subwoofer,
+// while keeping rear surround speakers completely quiet (sur_out=0).
+TEST_CASE("upmix=frontstage: 3.1 sends to Center while keeping rear surrounds quiet")
+{
+  SpdifEncoder::Params p;
+  p.sampleRate = 48000;
+  p.inSampleFmt = AV_SAMPLE_FMT_FLT;
+  p.upmix = SpdifEncoder::Upmix::FrontStage;
+  AVChannelLayout lay = AV_CHANNEL_LAYOUT_STEREO;
+  av_channel_layout_copy(&p.inLayout, &lay);
+  SpdifEncoder enc;
+  bool ok = enc.Init(p);
+  av_channel_layout_uninit(&p.inLayout);
+  REQUIRE(ok);
+
+  const int fpp = enc.FramesPerPacket();
+  std::vector<float> in(static_cast<size_t>(fpp) * 2);
+  std::vector<uint8_t> out(SpdifEncoder::kMaxBytesPerPacket);
+  std::vector<uint8_t> stream;
+  long long t = 0;
+  for (int pk = 0; pk < 24; ++pk)
+  {
+    for (int i = 0; i < fpp; ++i)
+    {
+      float s = 0.3f * static_cast<float>(std::sin(2.0 * kPi * 440.0 * double(t + i) / 48000.0));
+      in[2 * i] = s;     // L
+      in[2 * i + 1] = s; // R (in-phase mono/vocal dialogue)
+    }
+    t += fpp;
+    int n = enc.EncodePacket(reinterpret_cast<uint8_t*>(in.data()), out.data(),
+                             static_cast<int>(out.size()));
+    if (n > 0) stream.insert(stream.end(), out.data(), out.data() + n);
+  }
+  REQUIRE(stream.size() > static_cast<size_t>(6144) * 4);
+
+  std::vector<double> rms = DecodeSpdifAc3Rms(stream.data(), static_cast<int>(stream.size()));
+  REQUIRE(rms.size() >= 6);
+
+  MESSAGE("FrontStage 3.1 RMS: FL=" << rms[0] << " FR=" << rms[1] << " FC=" << rms[2]
+          << " LFE=" << rms[3] << " BL=" << rms[4] << " BR=" << rms[5]);
+  // Center speaker must receive strong dialogue audio
+  CHECK(rms[2] > 0.05);
+  // Rear surrounds must be quiet (sur_out=0)
+  CHECK(0.5 * (rms[4] + rms[5]) < 0.005);
+}

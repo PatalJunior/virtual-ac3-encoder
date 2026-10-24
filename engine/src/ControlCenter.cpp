@@ -426,8 +426,8 @@ void SaveConfiguration(int reloadId = 0) {
     cfg["latency"] = latencies[std::clamp(g_latencyPreset, 0, 4)];
     cfg.erase("safe"); // Use preset
 
-    const char* upmixes[] = {"dynamic", "always", "off"};
-    cfg["upmix"] = upmixes[std::clamp(g_upmixMode, 0, 2)];
+    const char* upmixes[] = {"dynamic", "front", "always", "always_front", "off"};
+    cfg["upmix"] = upmixes[std::clamp(g_upmixMode, 0, 4)];
 
     WriteKvAtomic(g_configPath, cfg);
     WriteControlFile(false, reloadId);
@@ -479,8 +479,10 @@ void LoadConfiguration() {
     else g_latencyPreset = 2; // balanced
 
     const std::string up = cfg["upmix"];
-    if (up == "off") g_upmixMode = 2;
-    else if (up == "always") g_upmixMode = 1;
+    if (up == "front" || up == "3.1" || up == "frontstage" || up == "center_lfe") g_upmixMode = 1;
+    else if (up == "always") g_upmixMode = 2;
+    else if (up == "always_front" || up == "always_3.1") g_upmixMode = 3;
+    else if (up == "off") g_upmixMode = 4;
     else g_upmixMode = 0; // dynamic surround (or legacy "surround")
 
     // Read control gains
@@ -1156,9 +1158,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
             // Stereo Upmixing
             const char* upmixes[] = {
-                "Dynamic Surround (Auto: Upmix Stereo to 5.1, Pass 5.1 Discrete Untouched)",
-                "Always Surround (Force 5.1 Upmix)",
-                "Off (Plain Multichannel Passthrough / Front Stereo Only)"
+                "Dynamic Surround 5.1 (Auto: Center + Sub + Rears for Stereo, Discrete 5.1 Untouched)",
+                "Front Stage 3.1 (Center + Subwoofer / LFE, Rears Silent - Home Theater Recommended)",
+                "Always Surround 5.1 (Forced 5.1 on All Audio)",
+                "Always Front Stage 3.1 (Forced 3.1 on All Audio - Rears Silent)",
+                "Off (Pure Stereo 2.0: Front L/R Only, Center & Sub Silent)"
             };
             if (ImGui::Combo("Stereo Upmix", &g_upmixMode, upmixes, IM_ARRAYSIZE(upmixes))) {
                 TriggerApplySettings();

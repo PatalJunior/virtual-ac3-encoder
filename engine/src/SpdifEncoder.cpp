@@ -183,8 +183,9 @@ bool SpdifEncoder::Init(const Params& p)
   // Input conditioning: either the `surround` upmix filter (stereo->5.1) or plain swr
   // convert/downmix. When input is already multichannel but upmix is requested, use
   // "dynamic" mode: keep both paths live and detect stereo content at runtime.
-  const bool wantUpmix = (p.upmix == Upmix::Surround || p.upmix == Upmix::Always);
-  alwaysUpmix_ = (p.upmix == Upmix::Always);
+  upmixMode_ = p.upmix;
+  const bool wantUpmix = (p.upmix != Upmix::Off);
+  alwaysUpmix_ = (p.upmix == Upmix::Always || p.upmix == Upmix::AlwaysFront);
   useFilter_ = (wantUpmix && inLayout_.nb_channels <= 2);
   dynamicUpmix_ = (wantUpmix && inLayout_.nb_channels > 2);
 
@@ -271,6 +272,7 @@ void SpdifEncoder::Close()
   useDts_ = false;
   dynamicUpmix_ = false;
   alwaysUpmix_ = false;
+  upmixMode_ = Upmix::Off;
   effectivelyStereo_ = true;
   av_channel_layout_uninit(&filterInLayout_);
   stereoExtract_.clear();
@@ -308,8 +310,20 @@ bool SpdifEncoder::BuildFilterGraph()
   std::snprintf(srcArgs, sizeof srcArgs,
                 "sample_rate=%d:sample_fmt=%s:channel_layout=%s:time_base=1/%d",
                 sampleRate_, av_get_sample_fmt_name(inSampleFmt_), inDesc, sampleRate_);
-  char surArgs[128];
-  std::snprintf(surArgs, sizeof surArgs, "chl_in=%s:chl_out=%s", inDesc, outDesc);
+  char surArgs[160];
+  const bool isFrontOnly = (upmixMode_ == Upmix::FrontStage || upmixMode_ == Upmix::AlwaysFront);
+  if (isFrontOnly)
+  {
+    std::snprintf(surArgs, sizeof surArgs,
+                  "chl_in=%s:chl_out=%s:sur_out=0:bc_out=0:fc_out=1.0:lfe_out=1.2:lfe_low=140",
+                  inDesc, outDesc);
+  }
+  else
+  {
+    std::snprintf(surArgs, sizeof surArgs,
+                  "chl_in=%s:chl_out=%s:fc_out=1.0:lfe_out=1.2:lfe_low=140",
+                  inDesc, outDesc);
+  }
   char fmtArgs[256];
   std::snprintf(fmtArgs, sizeof fmtArgs, "sample_fmts=fltp:sample_rates=%d:channel_layouts=%s",
                 sampleRate_, outDesc);
@@ -345,7 +359,8 @@ bool SpdifEncoder::BuildFilterGraph()
     if (!FeedFilter(silence.data()))
       break;
 
-  std::printf("[SpdifEncoder] surround upmix enabled%s (%s -> %s)\n",
+  std::printf("[SpdifEncoder] %s upmix enabled%s (%s -> %s)\n",
+              isFrontOnly ? "3.1 front stage (Center+Sub)" : "surround",
               dynamicUpmix_ ? " (dynamic: auto-detect stereo in multichannel)" : "",
               inDesc, outDesc);
   return true;

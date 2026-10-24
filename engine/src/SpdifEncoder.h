@@ -40,15 +40,18 @@ public:
   SpdifEncoder& operator=(const SpdifEncoder&) = delete;
 
   // Stereo->5.1 upmix mode.
-  // - Off: swr default rematrix (front channels only-ish)
-  // - Surround / Dynamic: auto-detects non-surround sources (rear surrounds silent, e.g. Spotify stereo
-  //   or Discord 3-channel dialogue) and synthesizes 5.1 surround; passes genuine 5.1 untouched.
-  // - Always: forces 5.1 surround upmixing unconditionally on all inputs.
+  // - Off: swr default rematrix (front channels only)
+  // - Surround: auto-detects non-surround sources and upmixes to all 5.1 speakers (Center + Sub + Rears)
+  // - FrontStage: auto-detects non-surround sources and upmixes to 3.1 (Center + Sub/LFE), keeping rears silent
+  // - Always: forces 5.1 surround upmixing unconditionally on all inputs
+  // - AlwaysFront: forces 3.1 upmixing (Center + Sub/LFE) unconditionally on all inputs
   enum class Upmix
   {
     Off,
     Surround,
+    FrontStage,
     Always,
+    AlwaysFront,
   };
 
   struct Params
@@ -128,6 +131,7 @@ private:
   // Both the filter graph (stereo input) and swr (multichannel passthrough) stay live.
   bool             dynamicUpmix_ = false;
   bool             alwaysUpmix_ = false;
+  Upmix            upmixMode_ = Upmix::Off;
   mutable bool     effectivelyStereo_ = true;
   AVChannelLayout  filterInLayout_{}; // layout fed to the filter graph (stereo in dynamic mode)
   std::vector<uint8_t> stereoExtract_; // buffer for extracted FL+FR frames

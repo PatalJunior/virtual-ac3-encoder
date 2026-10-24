@@ -410,6 +410,10 @@ int main(int argc, char** argv)
         pp.safeFrames = effectiveSafe;
         if (c.upmix == "always")
           pp.upmix = SpdifEncoder::Upmix::Always;
+        else if (c.upmix == "always_front" || c.upmix == "always_3.1")
+          pp.upmix = SpdifEncoder::Upmix::AlwaysFront;
+        else if (c.upmix == "front" || c.upmix == "3.1" || c.upmix == "frontstage" || c.upmix == "center_lfe")
+          pp.upmix = SpdifEncoder::Upmix::FrontStage;
         else if (c.upmix == "surround" || c.upmix == "dynamic")
           pp.upmix = SpdifEncoder::Upmix::Surround;
         else
