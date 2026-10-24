@@ -1,4 +1,10 @@
 // ControlCenter.cpp — Modern Dark UI with Dear ImGui (DirectX 11) for Virtual AC3/DTS Encoder.
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -34,19 +40,10 @@
 // Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-#pragma pack(push, 1)
-struct WAVEFORMATEXTENSIBLE_IEC61937 {
-    WAVEFORMATEXTENSIBLE FormatExt;
-    DWORD dwEncodedSamplesPerSec;
-    DWORD dwEncodedChannelCount;
-    DWORD dwAverageBytesPerSec;
-};
-#pragma pack(pop)
-
 namespace {
 
-static const GUID kGuidSubtypeDolbyDigital = { 0x00000092, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
-static const GUID kGuidSubtypeDts = { 0x00000093, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kGuidSubtypeDolbyDigital = KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL;
+static const GUID kGuidSubtypeDts = KSDATAFORMAT_SUBTYPE_IEC61937_DTS;
 
 constexpr UINT WM_TRAYICON = WM_USER + 101;
 constexpr UINT ID_TRAY_RESTORE = 2001;
@@ -520,8 +517,8 @@ void InitTrayIcon(HWND hwnd) {
     g_notifyIconData.uID = 1;
     g_notifyIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_notifyIconData.uCallbackMessage = WM_TRAYICON;
-    HICON hIcon = LoadIcon(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
-    if (!hIcon) hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    HICON hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
+    if (!hIcon) hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
     g_notifyIconData.hIcon = hIcon;
     wcscpy_s(g_notifyIconData.szTip, L"Virtual AC3 / DTS Control Center");
     Shell_NotifyIconW(NIM_ADD, &g_notifyIconData);
@@ -866,8 +863,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    HICON hAppIcon = LoadIcon(hInstance, MAKEINTRESOURCEW(101));
-    if (!hAppIcon) hAppIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    HICON hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
+    if (!hAppIcon) hAppIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
 
     WNDCLASSEXW wc = {
         sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, hInstance,

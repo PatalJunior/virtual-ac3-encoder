@@ -10,6 +10,8 @@ extern "C" {
 }
 
 #include <cstdint>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace {
