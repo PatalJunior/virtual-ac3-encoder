@@ -289,12 +289,27 @@ bool WasapiPassthrough::InitExclusive(int rate)
 bool WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
 {
   const size_t pktBytes = staging_.size();
+  const uint32_t required = static_cast<uint32_t>(burstsPerCycle_) * framesPerPacket_;
+  const uint32_t primeTargetFrames = required + params_.safeFrames;
+  const size_t primeTargetBytes = static_cast<size_t>(primeTargetFrames) * capBytesPerFrame_;
+
+  // Pre-roll priming: do not begin consuming real audio until the ring buffer has
+  // accumulated safeFrames of cushion. This completely eliminates micro-starvation
+  // caused by mismatched chunk boundaries (e.g. WASAPI 480-sample loopback vs 512-sample DTS).
+  if (!primed_)
+  {
+    if (ring_->BytesAvailable() >= primeTargetBytes)
+    {
+      primed_ = true;
+    }
+  }
+
   size_t outOff = 0;
   bool hadAudio = false;
   for (int b = 0; b < burstsPerCycle_; ++b)
   {
     const uint8_t* in;
-    if (ring_->BytesAvailable() >= pktBytes)
+    if (primed_ && ring_->BytesAvailable() >= pktBytes)
     {
       ring_->Read(staging_.data(), pktBytes);
       in = staging_.data();
@@ -302,7 +317,9 @@ bool WasapiPassthrough::EncodeIntoBuffer(BYTE* out)
     }
     else
     {
-      in = silence_.data(); // underrun: emit AC3 silence, leave the ring to refill
+      // If the buffer underruns, reset primed state so we re-cushion before resuming.
+      primed_ = false;
+      in = silence_.data(); // underrun: emit AC3/DTS silence, leave the ring to refill
     }
 
     const size_t slotBytes = burstBytes_;
@@ -337,6 +354,7 @@ bool WasapiPassthrough::Start()
   ResetEvent(stopEvent_);
   cycle_ = 0;
   minAvail_ = 0xFFFFFFFFu;
+  primed_ = false;
 
   // Pre-fill the first buffer (primes the encoder and avoids an initial underrun) before Start.
   BYTE* out = nullptr;
@@ -381,6 +399,7 @@ void WasapiPassthrough::Stop()
 {
   if (!running_.exchange(false))
     return;
+  primed_ = false;
   if (sharedMem_.IsOpen())
   {
     MeterSharedState* ms = sharedMem_.Get();
@@ -423,26 +442,35 @@ void WasapiPassthrough::ThreadProc()
     }
 
     // --- drift control (SoundPusher style with hysteresis & gentle step-trimming) ---
-    const uint32_t avail =
-        static_cast<uint32_t>(ring_->BytesAvailable() / capBytesPerFrame_);
-    if (avail < minAvail_)
-      minAvail_ = avail;
-
-    // Evaluate drift over a ~2-second window (e.g. 64 cycles for AC3 @ 32ms, 192 cycles for DTS @ 10.6ms)
-    const uint32_t driftCycles = (framesPerPacket_ <= 512) ? 192 : 64;
-    if (cycle_++ % driftCycles == 0)
+    // Only apply drift trimming when the stream is actively playing audio (primed_).
+    if (primed_)
     {
-      // Only trim if the MINIMUM available buffer over the entire window has exceeded desired + hysteresis.
-      // This deadband ensures that normal OS thread scheduling jitter (±3-5 ms) never causes an underrun.
-      const uint32_t hysteresis = framesPerPacket_;
-      if (minAvail_ != 0xFFFFFFFFu && minAvail_ > desired + hysteresis)
+      const uint32_t avail =
+          static_cast<uint32_t>(ring_->BytesAvailable() / capBytesPerFrame_);
+      if (avail < minAvail_)
+        minAvail_ = avail;
+
+      // Evaluate drift over a ~2-second window (e.g. 64 cycles for AC3 @ 32ms, 192 cycles for DTS @ 10.6ms)
+      const uint32_t driftCycles = (framesPerPacket_ <= 512) ? 192 : 64;
+      if (cycle_++ % driftCycles == 0)
       {
-        const uint32_t excess = minAvail_ - (desired + hysteresis / 2);
-        const uint32_t maxTrim = framesPerPacket_ / 2; // Trim gently in small steps
-        const uint32_t trim = std::min(excess, maxTrim);
-        ring_->Discard(static_cast<size_t>(trim) * capBytesPerFrame_);
+        // Only trim if the MINIMUM available buffer over the entire window has exceeded desired + hysteresis.
+        // This deadband ensures that normal OS thread scheduling jitter (+-3-5 ms) never causes an underrun.
+        const uint32_t hysteresis = framesPerPacket_;
+        if (minAvail_ != 0xFFFFFFFFu && minAvail_ > desired + hysteresis)
+        {
+          const uint32_t excess = minAvail_ - (desired + hysteresis / 2);
+          const uint32_t maxTrim = framesPerPacket_ / 2; // Trim gently in small steps
+          const uint32_t trim = std::min(excess, maxTrim);
+          ring_->Discard(static_cast<size_t>(trim) * capBytesPerFrame_);
+        }
+        minAvail_ = 0xFFFFFFFFu;
       }
+    }
+    else
+    {
       minAvail_ = 0xFFFFFFFFu;
+      cycle_ = 0;
     }
 
     BYTE* out = nullptr;

@@ -144,10 +144,11 @@ void WasapiCapture::ThreadProc()
 
   if (isEventDriven_ && dataEvent_)
   {
+    // 5 ms timeout ensures erratic Windows loopback events or quiet pauses never stall the drain loop
     HANDLE waits[2] = { dataEvent_, stopEvent_ };
     while (running_.load(std::memory_order_relaxed))
     {
-      DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+      DWORD w = WaitForMultipleObjects(2, waits, FALSE, 5);
       if (w == WAIT_OBJECT_0 + 1) // stop
         break;
       drain();

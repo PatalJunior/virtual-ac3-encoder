@@ -394,11 +394,17 @@ int main(int argc, char** argv)
       std::printf("Latency : %s (safeFrames = %u, ~%.1f ms)\n", c.latencyMode.c_str(),
                   effectiveSafe, 1000.0 * effectiveSafe / cf.sampleRate);
 
+      if (!capture->Start())
+      {
+        std::fprintf(stderr, "capture start failed\n");
+        return false;
+      }
+
       if (isPcm)
       {
         pcmOut = std::make_unique<WasapiPcmOutput>();
-        if (!pcmOut->Init(outDev.Get(), ring.get(), cf, effectiveSafe)) return false;
-        if (!pcmOut->Start()) { std::fprintf(stderr, "PCM output start failed\n"); return false; }
+        if (!pcmOut->Init(outDev.Get(), ring.get(), cf, effectiveSafe)) { capture->Stop(); return false; }
+        if (!pcmOut->Start()) { std::fprintf(stderr, "PCM output start failed\n"); capture->Stop(); return false; }
       }
       else
       {
@@ -419,16 +425,8 @@ int main(int argc, char** argv)
         else
           pp.upmix = SpdifEncoder::Upmix::Off;
 
-        if (!ac3Out->Init(outDev.Get(), ring.get(), cf, pp)) return false;
-        if (!ac3Out->Start()) { std::fprintf(stderr, "AC3/DTS passthrough start failed\n"); return false; }
-      }
-
-      if (!capture->Start())
-      {
-        std::fprintf(stderr, "capture start failed\n");
-        if (isPcm && pcmOut) pcmOut->Stop();
-        else if (ac3Out) ac3Out->Stop();
-        return false;
+        if (!ac3Out->Init(outDev.Get(), ring.get(), cf, pp)) { capture->Stop(); return false; }
+        if (!ac3Out->Start()) { std::fprintf(stderr, "AC3/DTS passthrough start failed\n"); capture->Stop(); return false; }
       }
 
       running = true;
